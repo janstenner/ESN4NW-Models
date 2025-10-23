@@ -6,11 +6,56 @@ const IN_DIR  = "Huser_Klee_complete/"
 const OUT_DIR = "HK_blocks"
 const STEP = Minute(10)
 
-const MIN_BLOCK_ROWS = 2   # vorher 6 – zum Testen runtersetzen
+const MIN_BLOCK_ROWS = 100
 const DEBUG = true
 
 const STEP_MS = 10 * 60 * 1000      # 10 Minuten in Millisekunden
 const TOL_MS  = 5 * 1000            # Toleranzfenster 5s (adjustierbar)
+
+
+const KEEP_COLS_ORIG = [
+    "Zeit",
+    "Wind Ø [m/s]","Wind max. [m/s]","Wind min. [m/s]",
+    "Drehzahl Ø [1/min]","Drehzahl max. [1/min]","Drehzahl min. [1/min]",
+    "Leistung Ø [kW]","Leistung max. [kW]","Leistung min. [kW]",
+    "Leistung Verfügb. Wind Ø [kW]",
+    "Leistung Verfügb. techn. Ø [kW]",
+    "Leistung Verfügb. force maj. Ø [kW]",
+    "Leistung Verfügb. ext. Ø [kW]",
+    "Anlage","Seriennr.","Alias"
+]
+
+const RENAME_MAP = Dict(
+    "Zeit" => "time",
+    "Wind Ø [m/s]" => "wind_mean_ms",
+    "Wind max. [m/s]" => "wind_max_ms",
+    "Wind min. [m/s]" => "wind_min_ms",
+    "Drehzahl Ø [1/min]" => "rpm_mean",
+    "Drehzahl max. [1/min]" => "rpm_max",
+    "Drehzahl min. [1/min]" => "rpm_min",
+    "Leistung Ø [kW]" => "power_mean_kw",
+    "Leistung max. [kW]" => "power_max_kw",
+    "Leistung min. [kW]" => "power_min_kw",
+    "Leistung Verfügb. Wind Ø [kW]" => "power_avail_wind_mean_kw",
+    "Leistung Verfügb. techn. Ø [kW]" => "power_avail_tech_mean_kw",
+    "Leistung Verfügb. force maj. Ø [kW]" => "power_avail_force_maj_mean_kw",
+    "Leistung Verfügb. ext. Ø [kW]" => "power_avail_ext_mean_kw",
+
+    "Anlage" => "plant",
+    "Seriennr." => "serial",
+    "Alias" => "alias",
+)
+
+const REQUIRED_COLS = [
+    "time",
+    "wind_mean_ms","wind_max_ms","wind_min_ms",
+    "rpm_mean","rpm_max","rpm_min",
+    "power_mean_kw","power_max_kw","power_min_kw",
+    "power_avail_wind_mean_kw",
+    "power_avail_tech_mean_kw",
+    "power_avail_force_maj_mean_kw",
+    "power_avail_ext_mean_kw",
+]
 
 # ----------------------------- Utilities -----------------------------
 
@@ -114,30 +159,6 @@ function select_sort_and_rename(df::DataFrame)::DataFrame
     # Map: kanonisierter -> originaler Header
     cmap = Dict(canon(c) => c for c in cols)
 
-    # gewünschte Originalnamen (deine Liste)
-    KEEP_COLS_ORIG = [
-        "Zeit",
-        "Wind Ø [m/s]","Wind max. [m/s]","Wind min. [m/s]",
-        "Drehzahl Ø [1/min]","Drehzahl max. [1/min]","Drehzahl min. [1/min]",
-        "Leistung Ø [kW]","Leistung max. [kW]","Leistung min. [kW]",
-        "Leistung Verfügb","Wind Ø [kW]","Leistung Verfügb. techn. Ø [kW]",
-        "Leistung Verfügb. force maj. Ø [kW]",
-        "Leistung Verfügb. ext. Ø [kW]",
-        "Anlage","Seriennr.","Alias"
-    ]
-
-    RENAME_MAP = Dict(
-        "Zeit"=>"time",
-        "Wind Ø [m/s]"=>"wind_mean_ms","Wind max. [m/s]"=>"wind_max_ms","Wind min. [m/s]"=>"wind_min_ms",
-        "Drehzahl Ø [1/min]"=>"rpm_mean","Drehzahl max. [1/min]"=>"rpm_max","Drehzahl min. [1/min]"=>"rpm_min",
-        "Leistung Ø [kW]"=>"power_mean_kw","Leistung max. [kW]"=>"power_max_kw","Leistung min. [kW]"=>"power_min_kw",
-        "Leistung Verfügb"=>"power_avail","Wind Ø [kW]"=>"wind_power_mean_kw",
-        "Leistung Verfügb. techn. Ø [kW]"=>"power_avail_tech_mean_kw",
-        "Leistung Verfügb. force maj. Ø [kW]"=>"power_avail_force_maj_mean_kw",
-        "Leistung Verfügb. ext. Ø [kW]"=>"power_avail_ext_mean_kw",
-        "Anlage"=>"plant","Seriennr."=>"serial","Alias"=>"alias"
-    )
-
     # finde in df die jeweils "entsprechende" Spalte per kanonischem Namen
     found_pairs = [(cmap[canon(orig)], RENAME_MAP[orig]) for orig in KEEP_COLS_ORIG if haskey(cmap, canon(orig))]
 
@@ -195,6 +216,13 @@ end
 
 function save_block_csv(block::DataFrame; outdir::String, base::String, idx::Int)
     if nrow(block) < MIN_BLOCK_ROWS
+        return nothing
+    end
+
+    missing_cols = [c for c in REQUIRED_COLS if !(c in names(block))]
+
+    if !isempty(missing_cols)
+        DEBUG && @info "Block übersprungen – fehlende Spalten" missing_cols
         return nothing
     end
     
