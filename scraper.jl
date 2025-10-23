@@ -9,6 +9,9 @@ const STEP = Minute(10)
 const MIN_BLOCK_ROWS = 2   # vorher 6 – zum Testen runtersetzen
 const DEBUG = true
 
+const STEP_MS = 10 * 60 * 1000      # 10 Minuten in Millisekunden
+const TOL_MS  = 5 * 1000            # Toleranzfenster 5s (adjustierbar)
+
 # ----------------------------- Utilities -----------------------------
 
 using Dates
@@ -166,7 +169,18 @@ function split_into_blocks(df::DataFrame)
     for i in 2:T
         t = df[i, "time"]
         s = season(t)
-        gap = (t - last_t != STEP)
+
+        diff_ms = Dates.value(t - last_t)    # Millisekunden-Differenz
+        gap = abs(diff_ms - STEP_MS) > TOL_MS
+
+        if diff_ms == 0
+            last_t = t; last_s = s
+            continue
+        end
+
+
+
+        #gap = (t - last_t != STEP)
         s_change = (s != last_s)
         if gap || s_change
             push!(blocks, DataFrame(@view df[start_idx:(i-1), : ]))
