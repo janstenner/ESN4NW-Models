@@ -1,8 +1,9 @@
 using CSV, DataFrames, Dates, Printf
 using StringEncodings
+using Dates
 
 # ----------------------------- Konfiguration -----------------------------
-const IN_DIR  = "Huser_Klee_complete/"
+const IN_DIR  = "HK_complete/"
 const OUT_DIR = "HK_blocks"
 const STEP = Minute(10)
 
@@ -59,8 +60,6 @@ const REQUIRED_COLS = [
 
 # ----------------------------- Utilities -----------------------------
 
-using Dates
-
 # Ersetzt alle "exotischen" Whitespaces (NBSP, schmale NBSP, etc.) durch normale Spaces
 # und schneidet vorne/hinten ab.
 clean_time_str(s) = begin
@@ -71,6 +70,9 @@ clean_time_str(s) = begin
     t = join(c == ' ' || !isspace(c) ? string(c) : " " for c in t)
     strip(t)
 end
+
+# Seriennummer für Pfade/Dateinamen säubern
+sanitize_label(s) = replace(string(s), r"[^\w\.\-]+" => "_")
 
 # Robustes Zeit-Parsing mit mehreren Formatversuchen
 function parse_time_any(x)
@@ -179,7 +181,11 @@ function select_sort_and_rename(df::DataFrame)::DataFrame
 end
 
 # Schneidet in Blöcke, wenn 10-Min-Gap ODER Seasonwechsel
-function split_into_blocks(df::DataFrame)
+function split_into_blocks(df_in::AbstractDataFrame)
+    # Materialisieren (SubDataFrame → DataFrame),
+    # damit alle Operationen/Views später "echt" sind:
+    df = DataFrame(df_in)
+
     @assert "time" ∈ names(df)
     T = nrow(df)
     if T == 0; return DataFrame[]; end
@@ -214,30 +220,30 @@ function split_into_blocks(df::DataFrame)
     return blocks
 end
 
-function save_block_csv(block::DataFrame; outdir::String, base::String, idx::Int)
+function save_block_csv(block::DataFrame; outdir::String, base::String, idx::Int, serial_label::AbstractString)
     if nrow(block) < MIN_BLOCK_ROWS
         return nothing
     end
 
     missing_cols = [c for c in REQUIRED_COLS if !(c in names(block))]
-
     if !isempty(missing_cols)
         DEBUG && @info "Block übersprungen – fehlende Spalten" missing_cols
         return nothing
     end
-    
+
     s = season(block[1, "time"])
     season_dir = joinpath(outdir, s)
-    isdir(season_dir) || mkpath(season_dir)
 
-    # kurze Blöcke (< ~1h) ignorieren
-    if nrow(block) < 6
-        return nothing
-    end
+    # Unterordner je Seriennummer
+    serial_dir = joinpath(season_dir, sanitize_label(serial_label))
+    isdir(serial_dir) || mkpath(serial_dir)
 
-    outpath = joinpath(season_dir, @sprintf("%s_%s_block%05d.csv", base, s, idx))
-    # CSV.write schreibt numerische Werte mit Dezimalpunkt; DataFrames -> CSV ist Standard. :contentReference[oaicite:2]{index=2}
-    CSV.write(outpath, block)
+    outpath = joinpath(
+        serial_dir,
+        @sprintf("%s_%s_%s_block%05d.csv", base, s, sanitize_label(serial_label), idx)
+    )
+
+    CSV.write(outpath, block)  # CSV.write lt. Doku. :contentReference[oaicite:1]{index=1}
     return outpath
 end
 
@@ -249,33 +255,54 @@ println("Gefundene CSVs: ", length(csv_files))
 total_blocks = 0
 for (fi, path) in enumerate(csv_files)
     global total_blocks
+    global gi, saved_total_this_file
+    global sub
+    global gdf
+
     println("Lese: $path")
-    df = read_csv_robust(path)           # Dezimal-Komma ✓ :contentReference[oaicite:3]{index=3}
-    sub = select_sort_and_rename(df)     # umbenennen ✓
-    blocks = split_into_blocks(sub)
     base = splitext(basename(path))[1]
+
+    df = read_csv_robust(path)           # Dezimal-Komma ✓ :contentReference[oaicite:3]{index=3}
+    sub = select_sort_and_rename(df)     # umbenennen ✓  :contentReference[oaicite:3]{index=3}
 
     if DEBUG
         println("  -> erkannte Spalten: ", names(sub))
         println("  -> Zeilen: ", nrow(sub))
     end
 
-    blocks = split_into_blocks(sub)
+    # --- NEU: pro Seriennummer gruppieren ---
+    if !("serial" in names(sub))
+        @warn "Spalte 'serial' fehlt – Datei wird übersprungen."
+        continue
+    end
 
-    if DEBUG
-        println("  -> Blöcke gesamt: ", length(blocks))
-        if !isempty(blocks)
-            println("  -> Block 1 Länge: ", nrow(blocks[1]))
+    gdf = groupby(sub, "serial")  # DataFrames.groupby nach Doku. :contentReference[oaicite:4]{index=4}
+
+    saved_total_this_file = 0
+    gi = 0
+    for g in gdf
+        
+
+        gi += 1
+        serial_val = g[1, "serial"]    # jede Gruppe hat eine Seriennr.
+
+        blocks = split_into_blocks(g)  # dein bestehender Split in kohärente 10-Min-Blöcke :contentReference[oaicite:5]{index=5}
+
+        if DEBUG
+            println("  -> Seriennr=$serial_val: Blöcke=", length(blocks),
+                    ", erste Blocklänge=", isempty(blocks) ? 0 : nrow(blocks[1]))
         end
+
+        saved = 0
+        for (i, blk) in enumerate(blocks)
+            out = save_block_csv(blk; outdir=OUT_DIR, base=base, idx=i, serial_label=string(serial_val))
+            saved += isnothing(out) ? 0 : 1
+        end
+        saved_total_this_file += saved
     end
 
-    saved = 0
-    for (i, blk) in enumerate(blocks)
-        out = save_block_csv(blk; outdir=OUT_DIR, base=base, idx=i)
-        saved += isnothing(out) ? 0 : 1
-    end
-    total_blocks += saved
-    println(" -> gespeichert: $(saved) Blöcke")
+    total_blocks += saved_total_this_file
+    println(" -> gespeichert: $(saved_total_this_file) Blöcke")
 end
 
 
