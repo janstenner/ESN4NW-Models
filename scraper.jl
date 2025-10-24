@@ -1,6 +1,8 @@
 using CSV, DataFrames, Dates, Printf
 using StringEncodings
 using Dates
+using Statistics
+using JSON3
 
 # ----------------------------- Konfiguration -----------------------------
 const IN_DIR  = "HK_complete/"
@@ -58,7 +60,60 @@ const REQUIRED_COLS = [
     "power_avail_ext_mean_kw",
 ]
 
+const NUMERIC_COLS = [
+    "wind_mean_ms","wind_max_ms","wind_min_ms",
+    "rpm_mean","rpm_max","rpm_min",
+    "power_mean_kw","power_max_kw","power_min_kw",
+    "power_avail_wind_mean_kw",
+    "power_avail_tech_mean_kw",
+    "power_avail_force_maj_mean_kw",
+    "power_avail_ext_mean_kw",
+]
+
 # ----------------------------- Utilities -----------------------------
+
+mutable struct Welford
+    n::Int64
+    mean::Float64
+    m2::Float64
+end
+Welford() = Welford(0, 0.0, 0.0)
+
+@inline function update!(w::Welford, x::Float64)
+    w.n += 1
+    δ   = x - w.mean
+    w.mean += δ / w.n
+    δ2  = x - w.mean
+    w.m2 += δ * δ2
+    return w
+end
+
+@inline function finalize(w::Welford)
+    if w.n <= 1
+        return (μ = w.mean, σ = 0.0, n = w.n)
+    else
+        return (μ = w.mean, σ = sqrt(w.m2 / (w.n - 1)), n = w.n)  # Stichproben-σ
+    end
+end
+
+# Setzt negative Werte auf 0 bzw. 0.0; missing bleibt unangetastet
+function clamp_negatives!(df, cols::Vector{String})
+    for c in cols
+        if c ∈ names(df)
+            col = df[!, c]
+            df[!, c] = map(col) do x
+                if x === missing
+                    missing
+                elseif x < 0
+                    zero(x)   # Int -> 0, Float -> 0.0
+                else
+                    x
+                end
+            end
+        end
+    end
+    return df
+end
 
 # Ersetzt alle "exotischen" Whitespaces (NBSP, schmale NBSP, etc.) durch normale Spaces
 # und schneidet vorne/hinten ab.
@@ -247,6 +302,32 @@ function save_block_csv(block::DataFrame; outdir::String, base::String, idx::Int
     return outpath
 end
 
+
+const stats_acc = Dict{Tuple{String,String,String}, Welford}()
+
+# Holt/erstellt den Accumulator für (season, serial, feature)
+@inline function acc_ref(season::String, serial::String, feat::String)
+    global stats_acc
+    key = (season, serial, feat)
+    get!(stats_acc, key) do
+        Welford()
+    end
+end
+
+# Nachlauf: in verschachteltes Dict für JSON transformieren
+function stats_nested_dict()
+    out = Dict{String, Any}()
+    for ((season, serial, feat), w) in stats_acc
+        snode = get!(out, season, Dict{String, Any}())
+        pnode = get!(snode, serial, Dict{String, Any}())
+        stat  = finalize(w)
+        pnode[feat] = Dict("mu"=>stat.μ, "sigma"=>stat.σ, "n"=>stat.n)
+    end
+    return out
+end
+
+
+
 # ----------------------------- Main -----------------------------
 isdir(OUT_DIR) || mkpath(OUT_DIR)
 csv_files = filter(f -> endswith(lowercase(f), ".csv"), readdir(IN_DIR; join=true))
@@ -264,6 +345,33 @@ for (fi, path) in enumerate(csv_files)
 
     df = read_csv_robust(path)           # Dezimal-Komma ✓ :contentReference[oaicite:3]{index=3}
     sub = select_sort_and_rename(df)     # umbenennen ✓  :contentReference[oaicite:3]{index=3}
+
+    # Season-Spalte (String) aus time ableiten, falls sie nicht schon existiert
+    if !(:season ∈ names(sub))
+        sub[!, :season] = [season(t) for t in sub[!, :time]]
+    end
+
+    # Negative Werte auf 0/0.0 setzen
+    clamp_negatives!(sub, NUMERIC_COLS)
+
+    # Achtung: serial kann missing sein -> String "missing"
+    serial_vec = string.(coalesce.(sub[!, :serial], "missing"))
+    season_vec = String.(sub[!, :season])
+
+    for feat in NUMERIC_COLS
+        if feat ∈ names(sub)
+            col = sub[!, feat]
+            @inbounds for i in 1:nrow(sub)
+                x = col[i]
+                if x !== missing
+                    # season, serial für diese Zeile
+                    s = season_vec[i]
+                    p = serial_vec[i]
+                    update!(acc_ref(s, p, feat), Float64(x))
+                end
+            end
+        end
+    end
 
     if DEBUG
         println("  -> erkannte Spalten: ", names(sub))
@@ -305,6 +413,11 @@ for (fi, path) in enumerate(csv_files)
     println(" -> gespeichert: $(saved_total_this_file) Blöcke")
 end
 
-
+# Stats als JSON sichern (lesbar formatiert)
+stats = stats_nested_dict()
+open(joinpath(OUT_DIR, "stats_by_season_serial.json"), "w") do io
+    JSON3.pretty(io, JSON3.write(stats))
+end
+println("Stats gespeichert: ", joinpath(OUT_DIR, "stats_by_season_serial.json"))
 
 println("Fertig. Gesamt gespeicherte Blöcke: $total_blocks")
