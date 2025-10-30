@@ -72,6 +72,36 @@ const NUMERIC_COLS = [
 
 # ----------------------------- Utilities -----------------------------
 
+
+# Symbols der numerischen Spalten (schneller auf Zeilenebene)
+const NUMERIC_SYMS = Symbol.(NUMERIC_COLS)
+
+# Row-Check: sind ALLE numerischen Spalten exakt 0/0.0 (keine missings)?
+@inline function all_numeric_zero(row)::Bool
+    @inbounds for s in NUMERIC_SYMS
+        x = row[s]
+        if x === missing
+            return false
+        end
+        if !(x == 0 || x == 0.0)
+            return false
+        end
+    end
+    return true
+end
+
+# Row-Check: Messwertfehler?
+# - wind_min_ms > 70  ODER
+# - rpm_min      > 70  ODER
+# - alle numerischen Felder 0/0.0
+@inline function is_bad_row(row)::Bool
+    wm = haskey(row, :wind_min_ms) ? row[:wind_min_ms] : missing
+    rr = haskey(row, :rpm_min)     ? row[:rpm_min]     : missing
+    w_bad = (wm !== missing) && (wm > 70)
+    r_bad = (rr !== missing) && (rr > 70)
+    return w_bad || r_bad || all_numeric_zero(row)
+end
+
 mutable struct Welford
     n::Int64
     mean::Float64
@@ -237,41 +267,89 @@ end
 
 # Schneidet in Blöcke, wenn 10-Min-Gap ODER Seasonwechsel
 function split_into_blocks(df_in::AbstractDataFrame)
-    # Materialisieren (SubDataFrame → DataFrame),
-    # damit alle Operationen/Views später "echt" sind:
-    df = DataFrame(df_in)
+    df = DataFrame(df_in)  # materialisieren (SubDataFrame → DataFrame)
 
     @assert "time" ∈ names(df)
     T = nrow(df)
     if T == 0; return DataFrame[]; end
+
+    has_bad = "_bad" ∈ names(df)
     blocks = DataFrame[]
+
+
+    # --- Führende Bad-Zeilen komplett überspringen ---
     start_idx = 1
+    if has_bad
+        while start_idx <= T && df[start_idx, :_bad] === true
+            start_idx += 1
+        end
+        if start_idx > T
+            return blocks  # nur Bad-Zeilen -> keine Blöcke
+        end
+    end
+
     last_t = df[start_idx, "time"]
     last_s = season(last_t)
-    for i in 2:T
+
+     i = start_idx + 1
+    while i <= T
         t = df[i, "time"]
         s = season(t)
 
-        diff_ms = Dates.value(t - last_t)    # Millisekunden-Differenz
-        gap = abs(diff_ms - STEP_MS) > TOL_MS
+        diff_ms = Dates.value(t - last_t)
+        # if diff_ms == 0
+        #     last_t = t; last_s = s
+        #     i += 1
+        #     continue
+        # end
 
-        if diff_ms == 0
-            last_t = t; last_s = s
-            continue
-        end
-
-
-
-        #gap = (t - last_t != STEP)
+        gap      = abs(diff_ms - STEP_MS) > TOL_MS
         s_change = (s != last_s)
-        if gap || s_change
-            push!(blocks, DataFrame(@view df[start_idx:(i-1), : ]))
-            start_idx = i
+        bad_here = has_bad && df[i, :_bad] === true
+
+        #@show t, df[i, "serial"]
+        # if t == DateTime("2022-12-19T15:40:00.0") && df[i, "serial"] == 1011086
+        #     @show bad_here, gap, s_change
+        #     @show df[i+1, "time"] - t
+        # end
+
+        if gap || s_change || bad_here || diff_ms == 0
+            # Block bis VOR diese Zeile schließen
+            if i - 1 >= start_idx
+                push!(blocks, DataFrame(@view df[start_idx:(i-1), : ]))
+            end
+
+            if bad_here
+                # --- zusammenhängenden Bad-Run komplett überspringen ---
+                while i <= T && df[i, :_bad] === true
+                    i += 1
+                end
+                start_idx = i
+                if start_idx > T
+                    break
+                end
+                last_t = df[start_idx, "time"]
+                last_s = season(last_t)
+                i = start_idx + 1
+                continue
+            else
+                # Gap/Seasonwechsel -> neuer Block beginnt an i
+                start_idx = i
+                last_t = t
+                last_s = s
+                i += 1
+                continue
+            end
         end
+
         last_t = t
         last_s = s
+        i += 1
     end
-    push!(blocks, DataFrame(@view df[start_idx:end, : ]))
+
+    if start_idx <= T
+        push!(blocks, DataFrame(@view df[start_idx:end, : ]))
+    end
     return blocks
 end
 
@@ -329,7 +407,11 @@ end
 
 
 # ----------------------------- Main -----------------------------
-isdir(OUT_DIR) || mkpath(OUT_DIR)
+if isdir(OUT_DIR) 
+    rm(OUT_DIR, recursive=true, force=true)
+end
+mkpath(OUT_DIR)
+
 csv_files = filter(f -> endswith(lowercase(f), ".csv"), readdir(IN_DIR; join=true))
 println("Gefundene CSVs: ", length(csv_files))
 
@@ -343,8 +425,8 @@ for (fi, path) in enumerate(csv_files)
     println("Lese: $path")
     base = splitext(basename(path))[1]
 
-    df = read_csv_robust(path)           # Dezimal-Komma ✓ :contentReference[oaicite:3]{index=3}
-    sub = select_sort_and_rename(df)     # umbenennen ✓  :contentReference[oaicite:3]{index=3}
+    global df = read_csv_robust(path)           # Dezimal-Komma ✓ :contentReference[oaicite:3]{index=3}
+    global sub = select_sort_and_rename(df)     # umbenennen ✓  :contentReference[oaicite:3]{index=3}
 
     # Season-Spalte (String) aus time ableiten, falls sie nicht schon existiert
     if !(:season ∈ names(sub))
@@ -354,17 +436,30 @@ for (fi, path) in enumerate(csv_files)
     # Negative Werte auf 0/0.0 setzen
     clamp_negatives!(sub, NUMERIC_COLS)
 
+    # Bad-Row-Maske (Messwertfehler): wird zum Splitten benutzt und von Stats ausgeschlossen
+    sub[!, :_bad] = falses(nrow(sub))
+    @inbounds for i in 1:nrow(sub)
+        sub[i, :_bad] = is_bad_row(view(sub, i, :))
+    end
+
+    # (Optional, aber hilfreich fürs Debugging)
+    if DEBUG
+        bad_cnt = count(sub[!, :_bad])
+        println("  -> Messwertfehler-Zeilen: ", bad_cnt)
+    end
+
     # Achtung: serial kann missing sein -> String "missing"
     serial_vec = string.(coalesce.(sub[!, :serial], "missing"))
     season_vec = String.(sub[!, :season])
 
+    badmask = "_bad" ∈ names(sub) ? sub[!, :_bad] : falses(nrow(sub))
     for feat in NUMERIC_COLS
         if feat ∈ names(sub)
             col = sub[!, feat]
             @inbounds for i in 1:nrow(sub)
+                if badmask[i]; continue; end              # <-- Bad-Zeilen überspringen
                 x = col[i]
                 if x !== missing
-                    # season, serial für diese Zeile
                     s = season_vec[i]
                     p = serial_vec[i]
                     update!(acc_ref(s, p, feat), Float64(x))

@@ -1,0 +1,10 @@
+time,wind_mean_ms,wind_max_ms,wind_min_ms,rpm_mean,rpm_max,rpm_min,power_mean_kw,power_max_kw,power_min_kw,power_avail_wind_mean_kw,power_avail_tech_mean_kw,power_avail_force_maj_mean_kw,power_avail_ext_mean_kw,plant,serial,alias,season,_bad
+2021-11-29T18:40:00.0,2.3,4.8,0.2,0.0,0.04,0.0,0,0,0,35,35,0,35,20,920696,ABC,Herbst,false
+2021-11-29T18:50:00.0,2.5,5.6,0.7,0.0,0.04,0.0,0,0,0,39,39,0,39,20,920696,ABC,Herbst,false
+2021-11-29T19:00:00.0,2.6,5.7,0.5,0.02,0.34,0.0,0,0,0,61,59,2,61,20,920696,ABC,Herbst,false
+2021-11-29T19:10:00.0,1.6,0.0,6553.5,0.0,0.0,655.35,0,0,0,2,0,2,2,20,920696,ABC,Herbst,true
+2021-11-29T19:20:00.0,1.6,0.0,6553.5,0.0,0.0,655.35,0,0,0,2,0,2,2,20,920696,ABC,Herbst,true
+2021-11-29T19:30:00.0,1.6,0.0,6553.5,0.0,0.0,655.35,0,0,0,2,0,2,2,20,920696,ABC,Herbst,true
+2021-11-29T19:40:00.0,1.9,4.7,0.0,0.0,0.0,0.0,0,0,0,11,9,3,11,20,920696,ABC,Herbst,false
+2021-11-29T19:50:00.0,1.8,4.3,0.6,0.0,0.0,0.0,0,0,0,7,0,7,7,20,920696,ABC,Herbst,false
+2021-11-29T20:00:00.0,1.7,5.5,0.3,0.0,0.27,0.0,0,0,0,6,1,5,6,20,920696,ABC,Herbst,false
