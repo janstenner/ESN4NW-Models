@@ -40,7 +40,7 @@ end
 # ---- Hauptlogik: eine CSV lesen, erste Zeile in Embedding umwandeln ----
 function main(path::AbstractString)
     # CSV mit deutschem Dezimal-Komma robust einlesen (Punkt als Tausendertrenner wird ignoriert)
-    df = CSV.read(path, DataFrame; normalizenames=false, decimal=',', groupmark='.')
+    df = CSV.read(path, DataFrame; normalizenames=false)
     # Wir erwarten vorbereitete/später umbenannte Spalten (snake_case), inkl. :time, :serial, :alias
     @assert "time" ∈ names(df) "Spalte 'time' fehlt. Bitte vorbereitete CSV (Scraper-Output) verwenden."
 
