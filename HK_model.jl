@@ -1,0 +1,234 @@
+using Flux, NNlib, LinearAlgebra, Statistics
+
+# --------------------------
+# Hyperparameter
+# --------------------------
+const D_IN   = 19          # 4 (Season one-hot) + 2 (sin/cos Zeit) + 14 numerische Kanäle
+const D_OUT  = 13          # Ziel-Dimension: deine 14 kontinuierlichen Kanäle für t+1
+const D_MODEL= 128
+const N_HEAD = 4
+const N_LAY  = 4
+const D_FF   = 256
+const DROPOUT= 0.1
+const RANK   = 4           # Low-rank-Kovarianz-Rang
+const MAX_CTX = 20
+
+# --------------------------
+# Hilfen: Masken & Blöcke
+# --------------------------
+
+
+# x kann (D_IN, T) oder (T, D_IN) oder Vector{<:AbstractVecOrMat} sein:
+function ensure_3d(x; d_in::Int)
+    if x isa AbstractVector  # z.B. Vector{Matrix}
+        X = reduce(hcat, x)                  # (d_in, T) oder (T, d_in)
+    else
+        X = x
+    end
+    size(X,1) == d_in || (X = permutedims(X))  # bringe auf (d_in, T)
+    ndims(X) == 2 && (X = reshape(X, size(X,1), size(X,2), 1))  # → (d_in, T, 1)
+    return X
+end
+
+
+# Causale Maske: KVxQxHeadsxBatch
+make_causal(kv_len::Int, q_len::Int, nheads::Int, batch::Int) =
+    reshape(NNlib.make_causal_mask(zeros(Bool, kv_len, q_len)), kv_len, q_len, 1, 1) .|> x->x ? 1f0 : 0f0 .+ zeros(Float32, 0) # ensure Float32
+# (Flux erwartet mask als Array broadcastbar auf (kv_len, q_len, nheads, batch))
+
+# Transformer-Decoder-Block (Self-Attn + FFN)
+struct DecoderBlock
+    mha::MultiHeadAttention
+    ln1::LayerNorm
+    ln2::LayerNorm
+    ff::Chain
+    dropout::Dropout
+end
+
+function DecoderBlock(d_model::Int, nheads::Int, d_ff::Int; pdrop=0.1)
+    DecoderBlock(
+        MultiHeadAttention(d_model, nheads=nheads, dropout_prob=pdrop),
+        LayerNorm(d_model),
+        LayerNorm(d_model),
+        Chain(Dense(d_model, d_ff, gelu), Dropout(pdrop), Dense(d_ff, d_model)),
+        Dropout(pdrop)
+    )
+end
+
+# Vorwärts für einen Block (mit causal mask)
+function (m::DecoderBlock)(x, mask)
+    # x: (d_model, T, B)
+    y, _ = m.mha(x, x, x; mask=mask)   # Self-Attention
+    x = m.ln1(x .+ m.dropout(y))
+    z = m.ff(x)
+    x = m.ln2(x .+ m.dropout(z))
+    return x
+end
+
+# --------------------------
+# Modell: Eingangsprojektion -> N Decoder-Blöcke -> Gauß-Kopf
+# --------------------------
+struct ARTransformer
+    inproj::Dense
+    blocks::Vector{DecoderBlock}
+    ln_final::LayerNorm
+    # Gauß-Kopf Parameterizer:
+    #  - μ:       Dense(d_model, D_OUT)
+    #  - logσ:    Dense(d_model, D_OUT)
+    #  - U:       Dense(d_model, D_OUT*RANK)  (reshape zu D_OUT×RANK)
+    mu_head::Dense
+    logstd_head::Dense
+    u_head::Dense
+end
+
+function ARTransformer()
+    blocks = [DecoderBlock(D_MODEL, N_HEAD, D_FF; pdrop=DROPOUT) for _ in 1:N_LAY]
+    ARTransformer(
+        Dense(D_IN, D_MODEL), blocks, LayerNorm(D_MODEL),
+        Dense(D_MODEL, D_OUT),
+        Dense(D_MODEL, D_OUT),
+        Dense(D_MODEL, D_OUT*RANK)
+    )
+end
+
+# Vorwärts: gesamte Sequenz -> Parameter für t+1 auf dem letzten Zeitindex
+function (m::ARTransformer)(x)
+
+    x = ensure_3d(x; d_in=D_IN)          # ← neu, macht aus 2D/Vector → 3D
+
+
+    # x: (D_IN, T, B)  〈— deine eingebetteten Features pro Schritt
+    h = m.inproj(x)            # (D_MODEL, T, B)
+    T = size(h, 2); B = size(h, 3)
+    mask = repeat(NNlib.make_causal_mask(zeros(Bool, T, T)), 1, 1, N_HEAD, B) # (T,T,Heads,B), Bool
+
+    # MultiHeadAttention will (kv_len,q_len,heads,batch); unsere (T,T,…) passt
+    for blk in m.blocks
+        h = blk(h, mask)
+    end
+    h = m.ln_final(h)          # (D_MODEL, T, B)
+
+    # Wir nehmen den letzten Zeitindex (t) und geben Parameter für (t+1) aus:
+    h_last = h[:, end, :]      # (D_MODEL, B)
+
+    μ      = m.mu_head(h_last)              # (D_OUT, B)
+    logσ   = m.logstd_head(h_last)          # (D_OUT, B)
+    U_flat = m.u_head(h_last)               # (D_OUT*RANK, B)
+    # Reshape U zu (D_OUT, RANK, B)
+    U      = reshape(U_flat, D_OUT, RANK, B)
+
+    return μ, logσ, U
+end
+
+# --------------------------
+# NLL: multivariate Gauß, Kovarianz Σ = U Uᵀ + diag(σ²)
+# --------------------------
+function nll_mvg_lowrank(mu, logσ, U, y)
+    # mu:   (D_OUT,B), logσ: (D_OUT,B), U: (D_OUT,RANK,B), y: (D_OUT,B)
+    B = size(mu, 2)
+    loss = 0.0
+    @inbounds for b in 1:B
+        μb   = view(mu, :, b)
+        logσb= view(logσ, :, b)
+        σb   = exp.(logσb) .+ 1f-6             # jitter
+        Ub   = view(U, :, :, b)                # (D_OUT,RANK)
+        Σb   = Ub*Ub' .+ Diagonal(σb.^2)       # (D_OUT,D_OUT)
+        # Cholesky für logdet & Lösung
+        F    = cholesky(Symmetric(Σb + 1f-6I))
+        δ    = (y[:, b] .- μb)
+        α    = F \ δ
+        loss += 0.5f0 * (logdet(F) * 2f0 + dot(δ, α) + D_OUT*log(2f0*π))
+    end
+    return loss / B
+end
+
+# --------------------------
+# Mini-Train-Step (Teacher Forcing 1-Schritt)
+# --------------------------
+# batch_x: (D_IN, T, B), batch_y: (D_OUT, B)  —> y ist Ziel für t+1
+function loss_fun(model, batch_x, batch_y)
+    μ, logσ, U = model(batch_x)
+    nll_mvg_lowrank(μ, logσ, U, batch_y)
+end
+
+# Beispiel-Optimierer
+model = ARTransformer()
+opt = Flux.setup(Flux.AdamW(1e-3), model)
+
+# Dummy-Schleife (du ersetzt batch_x/batch_y mit deinem DataLoader)
+# for (batch_x, batch_y) in loader
+#     gs = Flux.gradient(model) do m
+#         loss_fun(m, batch_x, batch_y)
+#     end
+#     Flux.update!(opt, model, gs)
+# end
+
+# --------------------------
+# Sampler (autoregressiv)
+# --------------------------
+function sample_autoregressive(model::ARTransformer, x0; steps::Int)
+    # x0: initiale Sequenz (D_IN, T0, 1) mit deinen Features bis t0 (inkl. Season+Zeit+Kanäle)
+    x = x0
+    ysamp = Matrix{Float32}(undef, D_OUT, steps)
+    for s in 1:steps
+        μ, logσ, U = model(x)                 # Parameter für t+1
+        σ  = exp.(logσ) .+ 1f-6
+        Σ  = U[:,:,1]*U[:,:,1]' .+ Diagonal(σ[:,1].^2)
+        F  = cholesky(Symmetric(Σ + 1f-6I))
+        # Ziehe y_{t+1}
+        ϵ  = randn(Float32, D_OUT)
+        yt = μ[:,1] .+ F.L * ϵ
+        ysamp[:, s] = yt
+
+        
+        xin_next = build_input_from_prediction(x[:, end, 1], yt)  # <- implementiere selbst
+        x = hcat(x, reshape(xin_next, D_IN, 1, 1))
+
+        T = size(x, 2)
+        if T > MAX_CTX
+            x = @view x[:, T - MAX_CTX + 1:T, :]       # SubArray-View: keine Kopie
+        end
+    end
+    return ysamp
+end
+
+
+function build_input_from_prediction(x_last::AbstractVector, y_pred::AbstractVector; step_minutes::Int=10)
+    @assert length(x_last) == D_IN  "x_last length mismatch"
+    @assert length(y_pred) == D_OUT "y_pred length mismatch"
+
+    out = Vector{Float32}(undef, D_IN)
+
+    # 1) Season-OneHot unverändert kopieren
+    @inbounds for i in 1:4
+        out[i] = Float32(x_last[i])
+    end
+
+    # 2) Zeit: sin/cos (Index 5/6) um Δθ = 2π*(step_minutes/1440) rotieren
+    s = Float32(x_last[5])
+    c = Float32(x_last[6])
+    δ  = 2f0 * π * Float32(step_minutes) / 1440f0
+    sδ = sin(δ)
+    cδ = cos(δ)
+
+    s_next = s * cδ + c * sδ        # sin(a+b) = sin a cos b + cos a sin b
+    c_next = c * cδ - s * sδ        # cos(a+b) = cos a cos b − sin a sin b
+
+    # leichte Renorm gegen Rundungsdrift
+    r2 = s_next*s_next + c_next*c_next
+    if abs(r2 - 1f0) > 1f-6
+        invr = inv(sqrt(r2))
+        s_next *= invr
+        c_next *= invr
+    end
+
+    out[5] = s_next
+    out[6] = c_next
+
+    # 3) 13 vorhergesagte Kanäle übernehmen (im Trainings-Skalierungsraum!)
+    @inbounds for i in 1:D_OUT
+        out[6 + i] = Float32(y_pred[i])
+    end
+
+    return out
+end
