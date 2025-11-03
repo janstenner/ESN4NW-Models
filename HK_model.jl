@@ -17,6 +17,22 @@ const MAX_CTX = 20
 # Hilfen: Masken & Blöcke
 # --------------------------
 
+# === Zeit-LUT vorbereiten (2 x 144) ==========================================
+const SLOTS  = 144
+const Δθ     = 2f0 * π / Float32(SLOTS)
+
+# TIME_LUT[1, k] = sin(θ_k), TIME_LUT[2, k] = cos(θ_k), k=1..144
+const TIME_LUT = let M = Matrix{Float32}(undef, 2, SLOTS)
+    @inbounds for k in 1:SLOTS
+        s, c = sincos(Float32(k-1) * Δθ)
+        M[1,k] = s
+        M[2,k] = c
+    end
+    M
+end
+
+# robustes 1-basiertes Modul (1..SLOTS)
+@inline next_slot(k) = k == SLOTS ? 1 : k + 1
 
 # x kann (D_IN, T) oder (T, D_IN) oder Vector{<:AbstractVecOrMat} sein:
 function ensure_3d(x; d_in::Int)
@@ -166,10 +182,17 @@ opt = Flux.setup(Flux.AdamW(1e-3), model)
 # --------------------------
 # Sampler (autoregressiv)
 # --------------------------
-function sample_autoregressive(model::ARTransformer, x0; steps::Int)
+function sample_autoregressive(model::ARTransformer = model, x0 = nothing; steps::Int = 30)
     # x0: initiale Sequenz (D_IN, T0, 1) mit deinen Features bis t0 (inkl. Season+Zeit+Kanäle)
+    if isnothing(x0)
+        x0 = zeros(Float32,D_IN,1,1)
+        x0[1] = 1.0 # season Winter
+        t_idx = 1
+        x0[5:6] = TIME_LUT[:,t_idx]
+    end
+
     x = x0
-    ysamp = Matrix{Float32}(undef, D_OUT, steps)
+    ysamp = Matrix{Float32}(undef, D_IN, steps)
     for s in 1:steps
         μ, logσ, U = model(x)                 # Parameter für t+1
         σ  = exp.(logσ) .+ 1f-6
@@ -178,10 +201,11 @@ function sample_autoregressive(model::ARTransformer, x0; steps::Int)
         # Ziehe y_{t+1}
         ϵ  = randn(Float32, D_OUT)
         yt = μ[:,1] .+ F.L * ϵ
-        ysamp[:, s] = yt
+        
 
         
-        xin_next = build_input_from_prediction(x[:, end, 1], yt)  # <- implementiere selbst
+        xin_next, t_idx = build_input_from_prediction(x[:, end, 1], yt, t_idx) 
+        ysamp[:, s] = xin_next
         x = hcat(x, reshape(xin_next, D_IN, 1, 1))
 
         T = size(x, 2)
@@ -193,42 +217,32 @@ function sample_autoregressive(model::ARTransformer, x0; steps::Int)
 end
 
 
-function build_input_from_prediction(x_last::AbstractVector, y_pred::AbstractVector; step_minutes::Int=10)
-    @assert length(x_last) == D_IN  "x_last length mismatch"
-    @assert length(y_pred) == D_OUT "y_pred length mismatch"
+function build_input_from_prediction(x_last::AbstractVector{<:Real},
+                                     y_pred::AbstractVector{<:Real},
+                                     t_idx::Int; step_slots::Int=1)
+    @assert length(x_last) == D_IN
+    @assert length(y_pred) == D_OUT
+    # nächsten Slot bestimmen (10 Minuten = 1 Slot)
+    k = t_idx
+    @inbounds for _ in 1:step_slots
+        k = next_slot(k)
+    end
 
     out = Vector{Float32}(undef, D_IN)
 
-    # 1) Season-OneHot unverändert kopieren
+    # 1) Season kopieren (1:4)
     @inbounds for i in 1:4
         out[i] = Float32(x_last[i])
     end
-
-    # 2) Zeit: sin/cos (Index 5/6) um Δθ = 2π*(step_minutes/1440) rotieren
-    s = Float32(x_last[5])
-    c = Float32(x_last[6])
-    δ  = 2f0 * π * Float32(step_minutes) / 1440f0
-    sδ = sin(δ)
-    cδ = cos(δ)
-
-    s_next = s * cδ + c * sδ        # sin(a+b) = sin a cos b + cos a sin b
-    c_next = c * cδ - s * sδ        # cos(a+b) = cos a cos b − sin a sin b
-
-    # leichte Renorm gegen Rundungsdrift
-    r2 = s_next*s_next + c_next*c_next
-    if abs(r2 - 1f0) > 1f-6
-        invr = inv(sqrt(r2))
-        s_next *= invr
-        c_next *= invr
+    # 2) Zeit aus LUT (5:6)
+    @inbounds begin
+        out[5] = TIME_LUT[1, k]  # sin
+        out[6] = TIME_LUT[2, k]  # cos
     end
-
-    out[5] = s_next
-    out[6] = c_next
-
-    # 3) 13 vorhergesagte Kanäle übernehmen (im Trainings-Skalierungsraum!)
+    # 3) 13 Kanäle (7:19)
     @inbounds for i in 1:D_OUT
-        out[6 + i] = Float32(y_pred[i])
+        out[6+i] = Float32(y_pred[i])
     end
 
-    return out
+    return out, k  # gib neuen Slot-Index zurück
 end
