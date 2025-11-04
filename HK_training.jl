@@ -1,3 +1,6 @@
+using Zygote
+using FileIO, JLD2
+
 # HK_training.jl
 #
 # Setzt das Training für den autoregressiven Transformer auf.
@@ -10,7 +13,7 @@ const SERIAL = "1011089"
 const BASE   = "HK_blocks"
 const BATCH  = 64
 const LR     = 1f-3
-const EPOCHS = 20
+const EPOCHS = 1
 const SHUFFLE = true
 const NHEADS_WARMUP = 0          # optional: nicht genutzt, Platzhalter
 const SEED = Int(floor(rand()*100000))
@@ -115,20 +118,21 @@ function train!(model; epochs::Int=EPOCHS, lr::Float32=LR, batch=BATCH, ctx::Int
         it = 0
         for (X, Y) in loader
             it += 1
+            losses = Float32[]
             # Vorwärts + Loss (über alle Zeitpositionen)
             gs = Flux.gradient(model) do m
                 μ, logσ, U = m(X)            # (D_OUT,T,B), (D_OUT,T,B), (D_OUT,RANK,T,B)
                 nll = nll_sequence(μ, logσ, U, Y)  # mittelt über T*B
 
-                L = ignore_derivatives() do
-                    mean(nll)
+                Zygote.ignore_derivatives() do
+                    push!(losses, mean(nll))
                 end
 
                 nll
             end
-            Flux.update!(opt, model, gs)
+            Flux.update!(opt, model, gs[1])
 
-            (it % 50 == 0 || it == 1) && _log(ep, it, L)
+            (it % 50 == 0 || it == 1) && _log(ep, it, losses[end])
         end
         # Epoch-Summary (einfacher Running-Loss − hier: letzter Minibatch)
         @info "epoch=$(ep) done."
@@ -143,3 +147,20 @@ end
 model = ARTransformer()
 @info "Start training" D_IN D_OUT CTX SERIAL EPOCHS BATCH LR
 # train!(model)
+
+
+
+
+function load_model(serial = SERIAL)
+
+    global model = FileIO.load("/saves_HK/$(serial).jld2","model")
+
+end
+
+function save_model()
+    isdir("/saves_HK") || mkdir("/saves_HK")
+
+
+    FileIO.save("/saves_HK/$(SERIAL).jld2","model",model)
+
+end
