@@ -25,6 +25,7 @@ using Flux, LinearAlgebra, Random, Statistics
 # ---------------------------------------------------------------------------
 include("HK_model.jl")
 include("HK_loader.jl")
+include("HK_eval.jl")
 
 # Sanity: D_IN/D_OUT kommen aus HK_model.jl; ORDERED_BASE etc. aus HK_loader.jl
 
@@ -114,11 +115,20 @@ function train!(model; epochs::Int=EPOCHS, lr::Float32=LR, batch=BATCH, ctx::Int
         @info "epoch=$(ep) iter=$(it)/$(total_batches) loss=$(round(loss, digits=5))"
     end
 
+    global losses = Float32[]
+
     for ep in 1:epochs
         it = 0
+
+        # re-shuffle the loader
+        if shuffle
+            println("Re-Shuffle!")
+            Random.shuffle!(loader.idx)
+        end
+
         for (X, Y) in loader
             it += 1
-            losses = Float32[]
+            
             # Vorwärts + Loss (über alle Zeitpositionen)
             gs = Flux.gradient(model) do m
                 μ, logσ, U = m(X)            # (D_OUT,T,B), (D_OUT,T,B), (D_OUT,RANK,T,B)
@@ -153,14 +163,19 @@ model = ARTransformer()
 
 function load_model(serial = SERIAL)
 
-    global model = FileIO.load("/saves_HK/$(serial).jld2","model")
+    data = FileIO.load("./saves_HK/$(serial).jld2")
+    global model = data["model"]
+    global losses = data["losses"]
 
 end
 
 function save_model()
-    isdir("/saves_HK") || mkdir("/saves_HK")
+    isdir("./saves_HK") || mkdir("./saves_HK")
 
 
-    FileIO.save("/saves_HK/$(SERIAL).jld2","model",model)
+    FileIO.save("./saves_HK/$(SERIAL).jld2",
+        "model", model,
+        "losses", losses
+    )
 
 end

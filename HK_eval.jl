@@ -16,7 +16,7 @@ Container für einen 500er-Run (real vs. pred) aus einem Block.
 - `real`    : (D_OUT, L)   Zielsoll, L=run_len
 - `pred`    : (D_OUT, L)   autoregressiv generiert
 """
-struct RunResult
+mutable struct RunResult
     season::String
     seq_id::Int
     start::Int
@@ -35,9 +35,9 @@ end
 @inline function nearest_slot_from_sc(sinval::Real, cosval::Real)::Int
     bestk = 1
     bestd = typemax(Float32)
-    @inbounds for k in 1:HKLoader.SLOTS
-        ds = Float32(HKLoader.TIME_LUT[1,k]) - Float32(sinval)
-        dc = Float32(HKLoader.TIME_LUT[2,k]) - Float32(cosval)
+    @inbounds for k in 1:SLOTS
+        ds = Float32(TIME_LUT[1,k]) - Float32(sinval)
+        dc = Float32(TIME_LUT[2,k]) - Float32(cosval)
         d  = ds*ds + dc*dc
         if d < bestd
             bestd = d; bestk = k
@@ -135,7 +135,8 @@ function collect_runs_for_season(model, seqs::Vector{<:AbstractMatrix};
             if size(E,2) >= ctx + run_len
                 rr = generate_run!(model, E; run_len=run_len, ctx=ctx, τ=τ)
                 # seq_id sauber setzen
-                rr = RunResult(season, si, rr.start, rr.real, rr.pred)
+                # rr = RunResult(season, si, rr.start, rr.real, rr.pred)
+                rr.seq_id = si
                 break
             end
         end
@@ -146,22 +147,22 @@ function collect_runs_for_season(model, seqs::Vector{<:AbstractMatrix};
 end
 
 """
-    traces_for_run(rr; cols=HKLoader.ORDERED_BASE)
+    traces_for_run(rr; cols=ORDERED_BASE)
 
 Erzeugt pro Feature zwei Scatter-Traces (real/pred) über 1:run_len.
 Gibt `Vector{AbstractTrace}` zurück (Länge = 2*D_OUT).
 """
-function traces_for_run(rr::RunResult; cols=HKLoader.ORDERED_BASE)
+function traces_for_run(rr::RunResult; cols=ORDERED_BASE)
     L = size(rr.real, 2)
     x = 1:L
-    traces = AbstractTrace[]
+    traces_real = AbstractTrace[]
+    traces_pred = AbstractTrace[]
     @inbounds for j in 1:length(cols)
-        name_real = "$(cols[j]) – real"
-        name_pred = "$(cols[j]) – pred"
-        push!(traces, scatter(; x=x, y=vec(rr.real[j, :]), mode="lines", name=name_real))
-        push!(traces, scatter(; x=x, y=vec(rr.pred[j, :]), mode="lines", name=name_pred, line=attr(dash="dash")))
+        name = cols[j]
+        push!(traces_real, scatter(; x=x, y=vec(rr.real[j, :]), mode="lines", name=name))
+        push!(traces_pred, scatter(; x=x, y=vec(rr.pred[j, :]), mode="lines", name=name))
     end
-    return traces
+    return traces_real, traces_pred
 end
 
 """
@@ -173,25 +174,42 @@ Return:
 - `traces_by_season  :: Dict{String, Vector{Vector{AbstractTrace}}}`
 """
 function eval_collect_all(model;
-                          serial::AbstractString="1011089",
-                          base::AbstractString="HK_blocks",
-                          ctx::Int=20, run_len::Int=500, n_runs::Int=3,
+                          serial::AbstractString=SERIAL,
+                          base::AbstractString=BASE,
+                          ctx::Int=CTX, run_len::Int=500, n_runs::Int=3,
                           τ::Float32=1f0, norm::Symbol=:year)
-    # Daten laden (du kannst norm=:season wählen, wenn gewünscht)
-    seqs = HKLoader.load_blocks_for_serial(base, serial; norm=norm)
+    
+    seqs = load_blocks_for_serial(base, serial; norm=norm)
 
-    results_by_season = Dict{String, Vector{RunResult}}()
-    traces_by_season  = Dict{String, Vector{Vector{AbstractTrace}}}()
+    global results_by_season = Dict{String, Vector{RunResult}}()
+
+    global traces_real_by_season  = Dict{String, Vector{Vector{AbstractTrace}}}()
+    global traces_pred_by_season  = Dict{String, Vector{Vector{AbstractTrace}}}()
 
     for s in SEASON_NAMES
         runs = collect_runs_for_season(model, seqs; season=s, n_runs=n_runs, run_len=run_len, ctx=ctx, τ=τ)
         results_by_season[s] = runs
-        trsets = Vector{Vector{AbstractTrace}}()
+        trsets_real = Vector{Vector{AbstractTrace}}()
+        trsets_pred = Vector{Vector{AbstractTrace}}()
         for r in runs
-            push!(trsets, traces_for_run(r))
+            traces_real, traces_pred = traces_for_run(r)
+            push!(trsets_real, traces_real)
+            push!(trsets_pred, traces_pred)
         end
-        traces_by_season[s] = trsets
+        traces_real_by_season[s] = trsets_real
+        traces_pred_by_season[s] = trsets_pred
+
+        p1 = plot(trsets_real[1])
+        p2 = plot(trsets_pred[1])
+        p = [p1;p2]
+
+        layout = Layout(
+        title="$s, Block $(runs[1].seq_id), line $(runs[1].start)",
+        )
+
+        relayout!(p, layout.fields)
+        display(p)
     end
 
-    return results_by_season, traces_by_season
+    
 end

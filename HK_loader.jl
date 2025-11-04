@@ -12,19 +12,19 @@ const ORDERED_BASE = [
     "power_avail_force_maj_mean_kw",
     "power_avail_ext_mean_kw",
 ]
-const D_OUT = length(ORDERED_BASE)         # 13
-const D_IN  = 4 + 2 + D_OUT                # 19
-const SLOTS = 144                          # 10-Minuten-Raster/Tag
+# const D_OUT = length(ORDERED_BASE)         # 13
+# const D_IN  = 4 + 2 + D_OUT                # 19
+# const SLOTS = 144                          # 10-Minuten-Raster/Tag
 
-# === Zeit-LUT (driftfrei) =====================================================
-const Δθ = 2f0 * π / Float32(SLOTS)
-const TIME_LUT = let M = Matrix{Float32}(undef, 2, SLOTS)
-    @inbounds for k in 1:SLOTS
-        s, c = sincos(Float32(k-1) * Δθ)   # Base.sincos ist effizient
-        M[1,k] = s; M[2,k] = c
-    end
-    M
-end
+# # === Zeit-LUT (driftfrei) =====================================================
+# const Δθ = 2f0 * π / Float32(SLOTS)
+# const TIME_LUT = let M = Matrix{Float32}(undef, 2, SLOTS)
+#     @inbounds for k in 1:SLOTS
+#         s, c = sincos(Float32(k-1) * Δθ)   # Base.sincos ist effizient
+#         M[1,k] = s; M[2,k] = c
+#     end
+#     M
+# end
 
 @inline function floor_slot_index(dt::DateTime)::Int
     # „14:21“ → Slot für 14:20 (floor auf 10-Minuten-Raster)
