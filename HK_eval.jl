@@ -6,6 +6,29 @@ using PlotlyJS            # pkg> add PlotlyJS
 
 const SEASON_NAMES = ("Winter","Fruehling","Sommer","Herbst")
 
+const PLOTLY13 = [
+    # wind_*  (Blues)
+    "#3182BD",  # wind_mean_ms  (mittelblau)
+    "#08519C",  # wind_max_ms   (dunkelblau)
+    "#9ECAE1",  # wind_min_ms   (hellblau)
+
+    # rpm_*   (Oranges)
+    "#E6550D",  # rpm_mean
+    "#A63603",  # rpm_max
+    "#FDAE6B",  # rpm_min
+
+    # power_* (Greens)
+    "#31A354",  # power_mean_kw
+    "#006D2C",  # power_max_kw
+    "#74C476",  # power_min_kw
+
+    # power_avail_* (Purples)
+    "#54278F",  # power_avail_wind_mean_kw
+    "#756BB1",  # power_avail_tech_mean_kw
+    "#9E9AC8",  # power_avail_force_maj_mean_kw
+    "#B6B6EAFF",  # power_avail_ext_mean_kw
+]
+
 """
     RunResult
 
@@ -165,6 +188,58 @@ function traces_for_run(rr::RunResult; cols=ORDERED_BASE)
     return traces_real, traces_pred
 end
 
+
+# ---- Denormalisierung ---------------------------------------------------------
+# Erwartet: stats_year[serial][feat] => (mu, sigma)
+# Fallback via get_stats_year(...): (mu=0, sigma=1), falls Eintrag fehlt.
+
+# liefert (real_denorm, pred_denorm) als Float32-Matrizen
+function denorm_mats(rr::RunResult, serial::AbstractString, stats_year; cols=ORDERED_BASE)
+    D = length(cols)
+    L = size(rr.real, 2)
+    real_d = Array{Float32}(undef, D, L)
+    pred_d = Array{Float32}(undef, D, L)
+    @inbounds for j in 1:D
+        feat = cols[j]
+        st   = get_stats_year(stats_year, String(serial), String(feat))
+        μ    = Float32(st.mu)
+        σ    = Float32(max(st.sigma, 1e-6))
+        # z -> original:  x = z*σ + μ
+        @views real_d[j, :] .= rr.real[j, :] .* σ .+ μ
+        @views pred_d[j, :] .= rr.pred[j, :] .* σ .+ μ
+    end
+    return real_d, pred_d
+end
+
+# Baut Traces aus *denormalisierten* Matrizen
+function traces_for_denorm_mats(real_d::AbstractMatrix, pred_d::AbstractMatrix; cols=ORDERED_BASE, colors::Union{Nothing,Vector{String}}=nothing)
+    L = size(real_d, 2)
+    x = 1:L
+    D = length(cols)
+
+    # Farben vorbereiten (zyklisch über Palette)
+    if colors === nothing
+        colors = [PLOTLY13[mod1(j, length(PLOTLY13))] for j in 1:D]
+    else
+        @assert length(colors) >= D "colors muss mind. so lang wie cols sein"
+    end
+
+    traces_real = AbstractTrace[]
+    traces_pred = AbstractTrace[]
+    @inbounds for j in 1:D
+        cname = cols[j]
+        col   = colors[j]
+        # gleiche Farbe, optional legendgroup für saubere Legenden-Gruppierung
+        push!(traces_real, scatter(; x=x, y=vec(real_d[j, :]),
+                                   mode="lines", name="$cname real",
+                                   line=attr(color=col), legendgroup=cname))
+        push!(traces_pred, scatter(; x=x, y=vec(pred_d[j, :]),
+                                   mode="lines", name="$cname pred",
+                                   line=attr(color=col), legendgroup=cname))
+    end
+    return traces_real, traces_pred
+end
+
 """
     eval_collect_all(model; serial="1011089", base="HK_blocks", ctx=20, run_len=500, n_runs=3, τ=1f0, norm=:year)
 
@@ -177,9 +252,11 @@ function eval_collect_all(model;
                           serial::AbstractString=SERIAL,
                           base::AbstractString=BASE,
                           ctx::Int=CTX, run_len::Int=500, n_runs::Int=3,
-                          τ::Float32=1f0, norm::Symbol=:year)
-    
+                          τ::Float32=1f0, norm::Symbol=:year,
+                          stats_path_year::AbstractString=joinpath(base, "stats_by_serial_year.json"))
+    # Daten + Jahres-Stats laden
     seqs = load_blocks_for_serial(base, serial; norm=norm)
+    stats_year = load_stats_year(stats_path_year)
 
     global results_by_season = Dict{String, Vector{RunResult}}()
 
@@ -189,13 +266,19 @@ function eval_collect_all(model;
     for s in SEASON_NAMES
         runs = collect_runs_for_season(model, seqs; season=s, n_runs=n_runs, run_len=run_len, ctx=ctx, τ=τ)
         results_by_season[s] = runs
+
+
         trsets_real = Vector{Vector{AbstractTrace}}()
         trsets_pred = Vector{Vector{AbstractTrace}}()
+
         for r in runs
-            traces_real, traces_pred = traces_for_run(r)
+            # <- Denormalisierung pro Run
+            real_d, pred_d = denorm_mats(r, serial, stats_year; cols=ORDERED_BASE)
+            traces_real, traces_pred = traces_for_denorm_mats(real_d, pred_d; cols=ORDERED_BASE)
             push!(trsets_real, traces_real)
             push!(trsets_pred, traces_pred)
         end
+
         traces_real_by_season[s] = trsets_real
         traces_pred_by_season[s] = trsets_pred
 
