@@ -246,3 +246,20 @@ function build_input_from_prediction(x_last::AbstractVector{<:Real},
 
     return out, k  # gib neuen Slot-Index zurück
 end
+
+
+# Gesamtzahl der trainierbaren Parameter
+function count_params(m)
+    s = 0
+    for p in Flux.params(m)      # iteriert über eindeutige Arrays
+        s += length(p)
+    end
+    return s
+end
+
+# Kleines Breakdown (optional)
+function param_breakdown(m)
+    sizes = map(size, Flux.params(m))
+    lens  = map(length, Flux.params(m))
+    return (; total=sum(lens), arrays=length(lens), sizes=sizes, lengths=lens)
+end

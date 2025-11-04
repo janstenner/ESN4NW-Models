@@ -115,7 +115,7 @@ function train!(model; epochs::Int=EPOCHS, lr::Float32=LR, batch=BATCH, ctx::Int
         @info "epoch=$(ep) iter=$(it)/$(total_batches) loss=$(round(loss, digits=5))"
     end
 
-    global losses = Float32[]
+    global losses
 
     for ep in 1:epochs
         it = 0
@@ -155,7 +155,10 @@ end
 
 
 model = ARTransformer()
-@info "Start training" D_IN D_OUT CTX SERIAL EPOCHS BATCH LR
+losses = Float32[]
+
+
+# @info "Start training" D_IN D_OUT CTX SERIAL EPOCHS BATCH LR
 # train!(model)
 
 
