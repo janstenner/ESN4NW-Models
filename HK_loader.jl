@@ -322,8 +322,8 @@ function next_batch!(X::AbstractArray, Y::AbstractArray,
     @inbounds for b in 1:B
         (si, t) = idx[p + b - 1]
         E = seqs[si]
-        X[:, :, b] = @view E[:, t-ctx+1:t]
-        Y[:, b]    = @view E[7:6+D_OUT, t+1]   # 13-dim Ziel
+        X[:, :, b] = @view E[:, t-ctx+1 : t]          # (D_IN, ctx)
+        Y[:, b]    = @view E[7:6+D_OUT, t-ctx+2 : t+1] # (D_OUT, ctx)
     end
 end
 
@@ -347,7 +347,7 @@ function Base.iterate(dl::HKWindowLoader, state::Int=1)
     last = min(state + dl.batchsize - 1, N)
     B    = last - state + 1
     X = Array{Float32}(undef, D_IN, dl.ctx, B)
-    Y = Array{Float32}(undef, D_OUT, B)
+    Y = Array{Float32}(undef, D_OUT, dl.ctx, B)
     next_batch!(X, Y, dl.seqs, dl.idx, state, dl.ctx)
     return ((X, Y), last + 1)
 end

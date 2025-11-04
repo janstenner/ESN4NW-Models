@@ -124,16 +124,16 @@ function (m::ARTransformer)(x)
     end
     h = m.ln_final(h)          # (D_MODEL, T, B)
 
-    # Wir nehmen den letzten Zeitindex (t) und geben Parameter für (t+1) aus:
-    h_last = h[:, end, :]      # (D_MODEL, B)
+    H      = reshape(h, D_MODEL, T*B)                                    # (D_MODEL, T*B)
+    MU_2d  = m.mu_head(H)                                                 # (D_OUT,   T*B)
+    LOG_2d = m.logstd_head(H)                                             # (D_OUT,   T*B)
+    U_2d   = m.u_head(H)                                                  # (D_OUT*RANK, T*B)
 
-    μ      = m.mu_head(h_last)              # (D_OUT, B)
-    logσ   = m.logstd_head(h_last)          # (D_OUT, B)
-    U_flat = m.u_head(h_last)               # (D_OUT*RANK, B)
-    # Reshape U zu (D_OUT, RANK, B)
-    U      = reshape(U_flat, D_OUT, RANK, B)
+    mu     = reshape(MU_2d,  D_OUT, T, B)                                 # (D_OUT, T, B)
+    logσ   = reshape(LOG_2d, D_OUT, T, B)                                 # (D_OUT, T, B)
+    U      = reshape(U_2d,   D_OUT, RANK, T, B)                           # (D_OUT, RANK, T, B)
 
-    return μ, logσ, U
+    return mu, logσ, U
 end
 
 # --------------------------
