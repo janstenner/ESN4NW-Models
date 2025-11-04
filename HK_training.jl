@@ -50,9 +50,9 @@ include("HK_loader.jl")
         w    = invD .* δ                         # D^{-1} δ
         M    = transpose(Ut) * w                 # (r,)
         G    = transpose(Ut) * (invD .* Ut)      # (r,r)
-        A    = G .+ I                            # (r,r)
+        A    = G + I                      # (r,r), identitätsverschoben
 
-        F    = cholesky(Symmetric(Matrix(A) + ϵ*I))
+        F    = cholesky(Symmetric(A) + ϵ*I)
         α    = F \ M
 
         mahal = dot(δ, w) - dot(M, α)
@@ -116,9 +116,14 @@ function train!(model; epochs::Int=EPOCHS, lr::Float32=LR, batch=BATCH, ctx::Int
         for (X, Y) in loader
             it += 1
             # Vorwärts + Loss (über alle Zeitpositionen)
-            gs, L = Flux.gradient(model) do m
+            gs = Flux.gradient(model) do m
                 μ, logσ, U = m(X)            # (D_OUT,T,B), (D_OUT,T,B), (D_OUT,RANK,T,B)
                 nll = nll_sequence(μ, logσ, U, Y)  # mittelt über T*B
+
+                L = ignore_derivatives() do
+                    mean(nll)
+                end
+
                 nll
             end
             Flux.update!(opt, model, gs)
@@ -137,4 +142,4 @@ end
 
 model = ARTransformer()
 @info "Start training" D_IN D_OUT CTX SERIAL EPOCHS BATCH LR
-train!(model)
+# train!(model)

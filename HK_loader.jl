@@ -318,7 +318,7 @@ ab Position p in idx.
 function next_batch!(X::AbstractArray, Y::AbstractArray,
                      seqs::Vector{<:AbstractMatrix},
                      idx::Vector{Tuple{Int,Int}}, p::Int, ctx::Int)
-    B = size(Y, 2)
+    B = size(Y, 3)
     @inbounds for b in 1:B
         (si, t) = idx[p + b - 1]
         E = seqs[si]
@@ -365,3 +365,25 @@ function make_loader(seqs::Vector{Matrix{Float32}}; ctx::Int=20, batchsize::Int=
 end
 
 # end # module
+
+
+
+function data_check(X)
+    for i in 1:size(X,3)
+        m = X[:,:,i]
+        if minimum(m) < -10 || maximum(m) > 10 || isnan(minimum(m))
+            @show i
+            @show m
+        end
+    end
+end
+
+function seqs_check()
+    for i in 1:length(seqs)
+        m = seqs[i]
+        if minimum(m) < -10 || maximum(m) > 10 || isnan(minimum(m))
+            @show i
+            @show m
+        end
+    end
+end
