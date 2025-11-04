@@ -323,7 +323,7 @@ function next_batch!(X::AbstractArray, Y::AbstractArray,
         (si, t) = idx[p + b - 1]
         E = seqs[si]
         X[:, :, b] = @view E[:, t-ctx+1 : t]          # (D_IN, ctx)
-        Y[:, b]    = @view E[7:6+D_OUT, t-ctx+2 : t+1] # (D_OUT, ctx)
+        Y[:, :, b]    = @view E[7:6+D_OUT, t-ctx+2 : t+1] # (D_OUT, ctx)
     end
 end
 
