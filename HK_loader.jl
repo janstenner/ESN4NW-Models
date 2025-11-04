@@ -218,24 +218,26 @@ end
 - bestimmt Season & Slot (floor auf 10 Minuten),
 - normalisiert ORDERED_BASE mit stats[(season, serial, feat)].
 """
-function embed_row(row, serial::String, stats)
+function embed_row(row, serial::String, stats;
+                   norm::Symbol = :year)
     # Zeit/Season
     dt = row[:time] isa DateTime ? row[:time] : DateTime(row[:time])
     s  = season_str(dt)
     s4 = season_onehot(s)
     k  = floor_slot_index(dt)
 
-    # Numerik: z-Score pro (season, serial, feature)
+    # Numerik: z-Score per Season ODER per Year (pro Serial)
     z = Vector{Float32}(undef, D_OUT)
     @inbounds for (i, feat) in enumerate(ORDERED_BASE)
         v = row[Symbol(feat)]
         v = (v === missing) ? NaN : v
-        ms = get_stats(stats, s, serial, feat)
+        ms = norm === :season ? get_stats(stats, s, serial, feat) :
+             norm === :year   ? get_stats_year(stats, serial, feat) :
+             error("Unknown norm mode: $norm")
         σ  = max(ms.sigma, 1e-6)
         z[i] = Float32((Float64(v) - ms.mu) / σ)
     end
 
-    # Embedding zusammenbauen
     emb = Vector{Float32}(undef, D_IN)
     emb[1:4]   .= (s4[1], s4[2], s4[3], s4[4])
     emb[5]     = TIME_LUT[1, k]
@@ -253,8 +255,19 @@ Liest alle CSVs unter `base_dir/Season/serial/*.csv`, baut pro CSV ein
 """
 function load_blocks_for_serial(base_dir::AbstractString, serial::AbstractString;
                                 seasons = ("Winter","Fruehling","Sommer","Herbst"),
-                                stats_path::AbstractString = joinpath(base_dir, "stats_by_season_serial.json"))
-    stats = load_stats(stats_path)
+                                stats_path::AbstractString = joinpath(base_dir, "stats_by_season_serial.json"),
+                                norm::Symbol = :year,
+                                stats_path_year::AbstractString = joinpath(base_dir, "stats_by_serial_year.json"))
+    # Stats laden je nach Modus
+    stats = nothing
+    if norm === :season
+        stats = load_stats(stats_path)
+    elseif norm === :year
+        stats = load_stats_year(stats_path_year)
+    else
+        error("Unknown norm mode: $norm")
+    end
+
     global seqs
     seqs  = Vector{Matrix{Float32}}()
     for s in seasons
@@ -267,7 +280,9 @@ function load_blocks_for_serial(base_dir::AbstractString, serial::AbstractString
             E = Matrix{Float32}(undef, D_IN, T)
             @inbounds for t in 1:T
                 row = df[t, :]
-                E[:, t] = embed_row(row, String(serial), stats)
+                E[:, t] = embed_row(row, String(serial),
+                                    stats;
+                                    norm=norm)
             end
             push!(seqs, E)
         end
