@@ -168,8 +168,8 @@ function loss_fun(model, batch_x, batch_y)
 end
 
 # Beispiel-Optimierer
-model = ARTransformer()
-opt = Flux.setup(Flux.AdamW(1e-3), model)
+# model = ARTransformer()
+# opt = Flux.setup(Flux.AdamW(1e-3), model)
 
 # Dummy-Schleife (du ersetzt batch_x/batch_y mit deinem DataLoader)
 # for (batch_x, batch_y) in loader
