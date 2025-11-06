@@ -3,8 +3,9 @@ using Flux, NNlib, LinearAlgebra, Statistics
 # --------------------------
 # Hyperparameter
 # --------------------------
-const D_IN   = 19          # 4 (Season one-hot) + 2 (sin/cos Zeit) + 14 numerische Kanäle
-const D_OUT  = 13          # Ziel-Dimension: deine 14 kontinuierlichen Kanäle für t+1
+const D_IN   = 19          # 4 (Season one-hot) + 2 (sin/cos Zeit) + 13 numerische Kanäle
+const D_OUT  = 13          # Ziel-Dimension: deine 13 kontinuierlichen Kanäle für t+1
+const NUM_IDX = 7:(6 + D_OUT)   # die 13 numerischen Kanäle im D_IN-Token
 const D_MODEL= 128
 const N_HEAD = 4
 const N_LAY  = 4
@@ -262,4 +263,189 @@ function param_breakdown(m)
     sizes = map(size, Flux.params(m))
     lens  = map(length, Flux.params(m))
     return (; total=sum(lens), arrays=length(lens), sizes=sizes, lengths=lens)
+end
+
+
+
+
+
+
+#-------- Flow Matching -------
+
+# --- t-Embedding --------------------------------------------------------------
+struct TEmbedding
+    B::Vector{Float32}      # Frequenzen b_k (L)
+    proj::Chain             # MLP: (2L) -> D_MODEL
+end
+
+function TEmbedding(d_model = D_MODEL; bands::Int=16, sigma::Float32=16f0)
+    Random.seed!(0)  # fixierbar
+    B = randn(Float32, bands) .* sigma
+    proj = Chain(
+        Dense(2*bands, d_model, x -> x .* (1f0 ./ (1f0 .+ exp.(-x)))),  # SiLU (oder swish)
+        Dense(d_model, d_model)
+    )
+    return TEmbedding(B, proj)
+end
+
+# t: Vector{Float32} der Länge BATCH oder scalar -> (D_MODEL, 1, BATCH)
+function (te::TEmbedding)(t::AbstractVector{<:Real})
+    # baue [sin(2π b_k t); cos(...)]  → (2L, B)
+    L = length(te.B); B = length(t)
+    F = Array{Float32}(undef, 2L, B)
+    @inbounds for j in 1:B
+        τ = Float32(t[j])
+        for k in 1:L
+            ω = 2f0 * π * te.B[k] * τ
+            F[k,     j] = sin(ω)
+            F[L + k, j] = cos(ω)
+        end
+    end
+    Z = te.proj(F)                       # (D_MODEL, B)
+    return reshape(Z, size(Z,1), 1, size(Z,2))  # (D_MODEL, 1, B) -> additiv aufs Flow-Token
+end
+
+# --- Token-Type-Embedding -----------------------------------------------------
+struct TypeEmbedding
+    E::Embedding  # 2 x D_MODEL
+end
+
+TypeEmbedding(d_model = D_MODEL) = TypeEmbedding(Embedding(2, d_model))
+
+# Broadcast-Helfer: addiert vektor auf ausgewählte Token-Spalten
+@inline function addvec!(H::AbstractArray{<:Real}, v::AbstractVector{<:Real}, cols::AbstractVector{Int})
+    vv = reshape(Float32.(v), :, 1, 1)  # (D_MODEL,1,1)
+    @inbounds for c in cols
+        H[:, c, :] .+= vv               # additiv auf alle Batch-Spalten
+    end
+    return H
+end
+
+
+struct FMTransformer
+    inproj::Dense
+    te::TEmbedding
+    ttype::TypeEmbedding
+    blocks::Vector{DecoderBlock}
+    ln_final::LayerNorm
+    head::Dense
+end
+
+function FMTransformer()
+    blocks = [DecoderBlock(D_MODEL, N_HEAD, D_FF; pdrop=DROPOUT) for _ in 1:N_LAY]
+    FMTransformer(
+        Dense(D_IN, D_MODEL),
+        TEmbedding(),
+        TypeEmbedding(),
+        blocks,
+        LayerNorm(D_MODEL),
+        Dense(D_MODEL, D_OUT)
+    )
+end
+
+
+function (m::FMTransformer)(x,t)
+
+    x = ensure_3d(x; d_in=D_IN)          # ← neu, macht aus 2D/Vector → 3D
+
+
+    # x: (D_IN, T, B)  〈— deine eingebetteten Features pro Schritt
+    h = m.inproj(x)            # (D_MODEL, T, B)
+
+    flow_col  = size(h, 2)                  # letztes Token
+    ctx_cols  = 1:(flow_col-1)
+
+    # 1) Token-Typ addieren
+    h = addvec!(h, m.ttype.E(1), collect(ctx_cols))  # Context-Typ
+    h = addvec!(h, m.ttype.E(2), [flow_col])         # Flow-Typ
+
+    # 2) t-Embedding nur aufs Flow-Token
+    # t_batch: Vector{Float32} Länge B, Werte in [0,1]
+    h[:, flow_col, :] .+= (m.te(t))           # (D_MODEL,1,B) broadcastet
+
+    T = size(h, 2); B = size(h, 3)
+    mask = repeat(NNlib.make_causal_mask(zeros(Bool, T, T)), 1, 1, N_HEAD, B) # (T,T,Heads,B), Bool
+
+    # MultiHeadAttention will (kv_len,q_len,heads,batch); unsere (T,T,…) passt
+    for blk in m.blocks
+        h = blk(h, mask)
+    end
+    h = m.ln_final(h)          # (D_MODEL, T, B)
+
+    # H      = reshape(h, D_MODEL, T*B)                                    # (D_MODEL, T*B)
+    output = m.head(@view h[:, flow_col:flow_col, :])  # (D_OUT,1,B)
+
+    return dropdims(output; dims=2)                     # (D_OUT,B)
+end
+
+
+# Baut aus dem letzten Kontext-Token ein Flow-Token, ersetzt NUR die numerischen 13 Werte
+# und setzt die Tageszeit auf den vorgegebenen Slot t_idx (Season-OneHot bleibt vom Template).
+function make_flow_token_from_template!(dest::AbstractVector{Float32},
+                                        template::AbstractVector{<:Real},
+                                        x_numeric::AbstractVector{<:Real},
+                                        t_idx::Int)
+    @assert length(dest) == D_IN
+    @assert length(template) == D_IN
+    @assert length(x_numeric) == D_OUT
+    @inbounds begin
+        # kopiere Season + alles
+        @views dest[:] = Float32.(template[:])
+        # setze Tageszeit (Flow-Integration: physische Tageszeit bleibt fix)
+        dest[5] = TIME_LUT[1, t_idx]   # sin
+        dest[6] = TIME_LUT[2, t_idx]   # cos
+        # ersetze numerische Kanäle durch aktuellen Flow-Zustand x_t
+        @views dest[NUM_IDX] .= Float32.(x_numeric)
+    end
+    return dest
+end
+
+# Ruft v_theta(x_t, t | Kontext) ab.
+# X_ctx: (D_IN, ctx, 1)    — dein 20er Fenster ohne Flow-Token
+# x_t  : (D_OUT,)          — aktueller Flow-Zustand (z-normalisiert)
+# t    : Float32 in [0,1]  — Flow-Zeit
+# t_idx: Int               — fixer Tageszeit-Slot des nächsten realen Zeitschritts
+function fm_velocity(model, X_ctx::AbstractArray{<:Real,3},
+                     x_t::AbstractVector{<:Real}, t::Float32, t_idx::Int)::Vector{Float32}
+    @assert size(X_ctx, 3) == 1
+    flow_vec = Vector{Float32}(undef, D_IN)
+    # Vorlage ist das letzte Kontext-Token
+    x_template = @view X_ctx[:, end, 1]
+    make_flow_token_from_template!(flow_vec, x_template, x_t, t_idx)
+    X = hcat(Float32.(X_ctx), reshape(flow_vec, D_IN, 1, 1))  # (D_IN, ctx+1, 1)
+    v = model(X, [t])   # (D_OUT, 1)
+    return vec(v)       # (D_OUT,)
+end
+
+# Explizites Euler: x_{n+1} = x_n + h * v_theta(x_n, t_n)
+function integrate_cfm_euler(model, X_ctx::AbstractArray{<:Real,3},
+                             t_idx::Int; steps::Int=8, x0::Union{Nothing,AbstractVector}=nothing,
+                             rng::AbstractRNG=Random.default_rng())::Vector{Float32}
+    h = 1f0/steps
+    x = x0 === nothing ? randn(rng, Float32, D_OUT) : Float32.(x0)
+    t = 0f0
+    @inbounds for _ in 1:steps
+        v = fm_velocity(model, X_ctx, x, t, t_idx)
+        x .+= h .* v
+        t += h
+    end
+    return x   # z-normalisierte Vorhersage für den nächsten Messvektor
+end
+
+# Midpoint (RK2/Heun): k1 = v(x_n, t_n), x_mid = x_n + 0.5h*k1,
+#                       k2 = v(x_mid, t_n+0.5h), x_{n+1} = x_n + h*k2
+function integrate_cfm_midpoint(model, X_ctx::AbstractArray{<:Real,3},
+                                t_idx::Int; steps::Int=8, x0::Union{Nothing,AbstractVector}=nothing,
+                                rng::AbstractRNG=Random.default_rng())::Vector{Float32}
+    h = 1f0/steps
+    x = x0 === nothing ? randn(rng, Float32, D_OUT) : Float32.(x0)
+    t = 0f0
+    @inbounds for _ in 1:steps
+        k1 = fm_velocity(model, X_ctx, x, t, t_idx)
+        xmid = x .+ (0.5f0*h) .* k1
+        k2 = fm_velocity(model, X_ctx, xmid, t + 0.5f0*h, t_idx)
+        x .+= h .* k2
+        t += h
+    end
+    return x
 end
