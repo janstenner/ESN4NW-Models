@@ -7,7 +7,6 @@ using FileIO, JLD2
 # - nutzt HK_model.jl (Decoder-only Transformer mit gaußschem Kopf)
 # - nutzt HK_loader.jl (CSV -> Embeddings -> Fenster -> Minibatches)
 #
-# You edit here:
 const CTX    = 20
 const SERIAL = "1011089"
 const BASE   = "HK_blocks"
@@ -20,6 +19,21 @@ const SEED = Int(floor(rand()*100000))
 
 const SAVE_DIR_AR = "./saves_HK"
 const SAVE_DIR_FM = "./saves_HK_FM"
+
+
+# --------------------------
+# Hyperparameter Model
+# --------------------------
+const D_IN   = 19          # 4 (Season one-hot) + 2 (sin/cos Zeit) + 13 numerische Kanäle
+const D_OUT  = 13          # Ziel-Dimension: deine 13 kontinuierlichen Kanäle für t+1
+const NUM_IDX = 7:(6 + D_OUT)   # die 13 numerischen Kanäle im D_IN-Token
+const D_MODEL= 64
+const N_HEAD = 4
+const N_LAY  = 4
+const D_FF   = 128
+const DROPOUT= 0.1
+const RANK   = 4           # Low-rank-Kovarianz-Rang
+const MAX_CTX = 30
 
 using Flux, LinearAlgebra, Random, Statistics
 
@@ -172,7 +186,9 @@ function train!(model; epochs::Int=EPOCHS, lr::Float32=LR, batch::Int=BATCH, ctx
     Random.seed!(seed)
     seqs   = load_blocks_for_serial(base, serial; norm=:year)
     loader = make_loader(seqs; ctx=ctx, batchsize=batch, shuffle=shuffle)
+
     opt    = Flux.setup(Flux.AdamW(lr), model)
+
     total_batches = length(loader)
 
     function _log(ep, it, loss)
@@ -218,7 +234,7 @@ function train!(model; epochs::Int=EPOCHS, lr::Float32=LR, batch::Int=BATCH, ctx
                 error("Unbekannter Modelltyp: $(typeof(model))")
             end
 
-            (it % 50 == 0 || it == 1) && _log(ep, it, losses[end])
+            (it % 50 == 0) && _log(ep, it, mean(losses[end-49:end]))
         end
         @info "epoch=$(ep) done."
     end
@@ -271,4 +287,32 @@ function load_model(path = SAVE_DIR_FM; serial=SERIAL)
     global losses = get(data, "losses", Float32[])  # falls älterer Save ohne losses
 
     return (path=path, mtype=typeof(model))
+end
+
+
+function plot_losses(smoothing = 50)
+    to_plot = Float32[]
+    for i in smoothing:length(losses)
+        push!(to_plot, mean(losses[i+1-smoothing:i]))
+    end
+
+    p = plot(to_plot)
+    display(p)
+end
+
+
+# Gesamtzahl der trainierbaren Parameter
+function count_params(m = model)
+    s = 0
+    for p in Flux.params(m)      # iteriert über eindeutige Arrays
+        s += length(p)
+    end
+    return s
+end
+
+# Kleines Breakdown (optional)
+function param_breakdown(m = model)
+    sizes = map(size, Flux.params(m))
+    lens  = map(length, Flux.params(m))
+    return (; total=sum(lens), arrays=length(lens), sizes=sizes, lengths=lens)
 end

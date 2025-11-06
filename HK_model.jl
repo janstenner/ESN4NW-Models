@@ -1,18 +1,6 @@
 using Flux, NNlib, LinearAlgebra, Statistics
 
-# --------------------------
-# Hyperparameter
-# --------------------------
-const D_IN   = 19          # 4 (Season one-hot) + 2 (sin/cos Zeit) + 13 numerische Kanäle
-const D_OUT  = 13          # Ziel-Dimension: deine 13 kontinuierlichen Kanäle für t+1
-const NUM_IDX = 7:(6 + D_OUT)   # die 13 numerischen Kanäle im D_IN-Token
-const D_MODEL= 128
-const N_HEAD = 4
-const N_LAY  = 4
-const D_FF   = 256
-const DROPOUT= 0.1
-const RANK   = 4           # Low-rank-Kovarianz-Rang
-const MAX_CTX = 20
+
 
 # --------------------------
 # Hilfen: Masken & Blöcke
@@ -249,21 +237,6 @@ function build_input_from_prediction(x_last::AbstractVector{<:Real},
 end
 
 
-# Gesamtzahl der trainierbaren Parameter
-function count_params(m = model)
-    s = 0
-    for p in Flux.params(m)      # iteriert über eindeutige Arrays
-        s += length(p)
-    end
-    return s
-end
-
-# Kleines Breakdown (optional)
-function param_breakdown(m = model)
-    sizes = map(size, Flux.params(m))
-    lens  = map(length, Flux.params(m))
-    return (; total=sum(lens), arrays=length(lens), sizes=sizes, lengths=lens)
-end
 
 
 
@@ -375,7 +348,6 @@ function (m::FMTransformer)(x,t)
     h = m.ln_final(h)          # (D_MODEL, T, B)
 
 
-    # H      = reshape(h, D_MODEL, T*B)                                    # (D_MODEL, T*B)
     output = m.head(Array(@view h[:, flow_col, :]))         # (D_OUT, B); copy vermeidet SubArray-Mutation
     return output
 end
