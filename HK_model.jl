@@ -250,7 +250,7 @@ end
 
 
 # Gesamtzahl der trainierbaren Parameter
-function count_params(m)
+function count_params(m = model)
     s = 0
     for p in Flux.params(m)      # iteriert über eindeutige Arrays
         s += length(p)
@@ -259,7 +259,7 @@ function count_params(m)
 end
 
 # Kleines Breakdown (optional)
-function param_breakdown(m)
+function param_breakdown(m = model)
     sizes = map(size, Flux.params(m))
     lens  = map(length, Flux.params(m))
     return (; total=sum(lens), arrays=length(lens), sizes=sizes, lengths=lens)
@@ -278,54 +278,49 @@ struct TEmbedding
     proj::Chain             # MLP: (2L) -> D_MODEL
 end
 
+# nur proj ist trainierbar
+Flux.@layer TEmbedding
+Flux.trainable(te::TEmbedding) = (proj = te.proj,)
+
 function TEmbedding(d_model = D_MODEL; bands::Int=16, sigma::Float32=16f0)
-    Random.seed!(0)  # fixierbar
     B = randn(Float32, bands) .* sigma
     proj = Chain(
-        Dense(2*bands, d_model, x -> x .* (1f0 ./ (1f0 .+ exp.(-x)))),  # SiLU (oder swish)
-        Dense(d_model, d_model)
+        Dense(2*bands, D_MODEL, x -> x .* (1f0 ./ (1f0 .+ exp.(-x)))),  # SiLU
+        Dense(D_MODEL, D_MODEL)
     )
     return TEmbedding(B, proj)
 end
 
 # t: Vector{Float32} der Länge BATCH oder scalar -> (D_MODEL, 1, BATCH)
 function (te::TEmbedding)(t::AbstractVector{<:Real})
-    # baue [sin(2π b_k t); cos(...)]  → (2L, B)
-    L = length(te.B); B = length(t)
-    F = Array{Float32}(undef, 2L, B)
-    @inbounds for j in 1:B
-        τ = Float32(t[j])
-        for k in 1:L
-            ω = 2f0 * π * te.B[k] * τ
-            F[k,     j] = sin(ω)
-            F[L + k, j] = cos(ω)
-        end
-    end
-    Z = te.proj(F)                       # (D_MODEL, B)
-    return reshape(Z, size(Z,1), 1, size(Z,2))  # (D_MODEL, 1, B) -> additiv aufs Flow-Token
+    t32  = Float32.(t)
+    L    = length(te.B)
+    Bsz  = length(t32)
+    Bcol = reshape(te.B, L, 1)        # (L,1)
+    trow = reshape(t32, 1, Bsz)       # (1,B)
+    ω    = (2f0 * π) .* (Bcol .* trow)     # (L,B)
+    F    = vcat(sin.(ω), cos.(ω))          # (2L,B) — reine Broadcasts, keine Mutation
+    Z    = te.proj(F)                       # (D_MODEL,B)
+    return reshape(Z, size(Z,1), 1, size(Z,2))  # (D_MODEL,1,B)
 end
 
-# --- Token-Type-Embedding -----------------------------------------------------
-struct TypeEmbedding
-    E::Embedding  # 2 x D_MODEL
+# --- Token-Type-Bias (statt Embedding) ---------------------------------------
+struct TypeBias
+    ctx::Vector{Float32}   # (D_MODEL,)
+    flow::Vector{Float32}  # (D_MODEL,)
 end
+Flux.@layer TypeBias     # macht die Felder trainierbar
 
-TypeEmbedding(d_model = D_MODEL) = TypeEmbedding(Embedding(2, d_model))
-
-# Broadcast-Helfer: addiert vektor auf ausgewählte Token-Spalten
-@inline function addvec!(H::AbstractArray{<:Real}, v::AbstractVector{<:Real}, cols::AbstractVector{Int})
-    vv = reshape(Float32.(v), :, 1, 1)  # (D_MODEL,1,1)
-    @inbounds for c in cols
-        H[:, c, :] .+= vv               # additiv auf alle Batch-Spalten
-    end
-    return H
-end
+TypeBias(d_model = D_MODEL) = TypeBias(
+    0.02f0 .* randn(Float32, d_model),
+    0.02f0 .* randn(Float32, d_model)
+)
 
 
 struct FMTransformer
     inproj::Dense
     te::TEmbedding
-    ttype::TypeEmbedding
+    ttype::TypeBias
     blocks::Vector{DecoderBlock}
     ln_final::LayerNorm
     head::Dense
@@ -336,7 +331,7 @@ function FMTransformer()
     FMTransformer(
         Dense(D_IN, D_MODEL),
         TEmbedding(),
-        TypeEmbedding(),
+        TypeBias(),
         blocks,
         LayerNorm(D_MODEL),
         Dense(D_MODEL, D_OUT)
@@ -352,16 +347,23 @@ function (m::FMTransformer)(x,t)
     # x: (D_IN, T, B)  〈— deine eingebetteten Features pro Schritt
     h = m.inproj(x)            # (D_MODEL, T, B)
 
-    flow_col  = size(h, 2)                  # letztes Token
-    ctx_cols  = 1:(flow_col-1)
 
     # 1) Token-Typ addieren
-    h = addvec!(h, m.ttype.E(1), collect(ctx_cols))  # Context-Typ
-    h = addvec!(h, m.ttype.E(2), [flow_col])         # Flow-Typ
+    # h: (D_MODEL, T, B)
+    flow_col = size(h, 2); B = size(h, 3)
+
+    # Type-Embeddings als (D_MODEL,1,1)
+    type_ctx  = reshape(m.ttype.ctx,  D_MODEL, 1, 1)  # (D_MODEL,1,1)
+    type_flow = reshape(m.ttype.flow, D_MODEL, 1, 1)  # (D_MODEL,1,1)
+    type_add = cat(repeat(type_ctx,  1, flow_col-1, B),
+                   repeat(type_flow, 1, 1,   B); dims=2)
+
+    h = h .+ type_add
 
     # 2) t-Embedding nur aufs Flow-Token
-    # t_batch: Vector{Float32} Länge B, Werte in [0,1]
-    h[:, flow_col, :] .+= (m.te(t))           # (D_MODEL,1,B) broadcastet
+    t_emb = m.te(t)  # (D_MODEL, 1, B)
+    t_add = cat(zeros(Float32, D_MODEL, flow_col-1, B), t_emb; dims=2)  # (D_MODEL, T, B)
+    h = h .+ t_add
 
     T = size(h, 2); B = size(h, 3)
     mask = repeat(NNlib.make_causal_mask(zeros(Bool, T, T)), 1, 1, N_HEAD, B) # (T,T,Heads,B), Bool
@@ -372,10 +374,10 @@ function (m::FMTransformer)(x,t)
     end
     h = m.ln_final(h)          # (D_MODEL, T, B)
 
-    # H      = reshape(h, D_MODEL, T*B)                                    # (D_MODEL, T*B)
-    output = m.head(@view h[:, flow_col:flow_col, :])  # (D_OUT,1,B)
 
-    return dropdims(output; dims=2)                     # (D_OUT,B)
+    # H      = reshape(h, D_MODEL, T*B)                                    # (D_MODEL, T*B)
+    output = m.head(Array(@view h[:, flow_col, :]))         # (D_OUT, B); copy vermeidet SubArray-Mutation
+    return output
 end
 
 

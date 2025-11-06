@@ -81,7 +81,7 @@ function sample_factor_tau(mu::AbstractVector{<:Real},
 end
 
 # Nimmt eine (D_IN, T)-Sequenz E, wählt random Start, erzeugt real & pred (beide Länge L)
-function generate_run!(model, E::AbstractMatrix{<:Real};
+function generate_run!(model::ARTransformer, E::AbstractMatrix{<:Real};
                        run_len::Int=500, ctx::Int=20, τ::Float32=1f0)
     T = size(E, 2)
     @assert T >= ctx + run_len "Sequenz zu kurz: T=$T < ctx+run_len=$(ctx+run_len)"
@@ -123,6 +123,63 @@ function generate_run!(model, E::AbstractMatrix{<:Real};
     season = season_from_onehot(@view E[1:4, 1])
     return RunResult(season, 0, s, real, pred)  # seq_id wird später gesetzt
 end
+
+
+# FM-Variante: autoregressiver 500er-Run via ODE-Integration (CFM)
+# nutzt integrate_cfm_euler / integrate_cfm_midpoint aus HK_model.jl
+function generate_run!(model::FMTransformer, E::AbstractMatrix{<:Real};
+                       run_len::Int=500, ctx::Int=20,
+                       τ::Float32=1f0,                # nur zur Signatur-Kompatibilität, wird ignoriert
+                       steps::Int=8, solver::Symbol=:midpoint,
+                       seed::Union{Nothing,Int}=nothing)
+
+    T = size(E, 2)
+    @assert T >= ctx + run_len "Sequenz zu kurz: T=$T < ctx+run_len=$(ctx+run_len)"
+    s = rand(1:(T - (ctx + run_len) + 1))
+
+    # Seed-Kontext X: (D_IN, ctx, 1)
+    X = reshape(Float32.(E[:, s:s+ctx-1]), D_IN, ctx, 1)
+
+    # initialer Tageszeit-Slot aus letzter Kontextspalte
+    s0 = X[5, end, 1]; c0 = X[6, end, 1]
+    t_idx = nearest_slot_from_sc(s0, c0)
+
+    # Ground truth-Ziele (z-normalisiert wie im Loader)
+    real = Array{Float32}(undef, D_OUT, run_len)
+    @inbounds real[:, :] = Float32.(E[7:6+D_OUT, s+ctx : s+ctx+run_len-1])
+
+    pred = Array{Float32}(undef, D_OUT, run_len)
+
+    rng = seed === nothing ? Random.default_rng() : MersenneTwister(seed)
+
+    @inbounds for i in 1:run_len
+        # Flow-Integration auf dem nächsten Tageszeit-Slot
+        t_idx_next = (t_idx == SLOTS) ? 1 : (t_idx + 1)
+        x̂ = if solver === :euler
+            integrate_cfm_euler(model, X, t_idx_next; steps=steps, rng=rng)
+        else
+            integrate_cfm_midpoint(model, X, t_idx_next; steps=steps, rng=rng)
+        end
+        pred[:, i] = x̂
+
+        # Nächstes Eingabe-Token bauen (Season bleibt, Tageszeit++ , numerische Kanäle = x̂)
+        xin = X[:, end, 1]
+        xin_next, t_idx = build_input_from_prediction(xin, x̂, t_idx)
+        xin_next3 = reshape(xin_next, D_IN, 1, 1)
+
+        # Sliding Window
+        if size(X, 2) < ctx
+            X = hcat(X, xin_next3)
+        else
+            X = cat(@view(X[:, 2:end, :]), xin_next3; dims=2)
+        end
+    end
+
+    season = season_from_onehot(@view E[1:4, 1])
+    return RunResult(season, 0, s, real, pred)
+end
+
+
 
 # Filtert seqs nach Season (prüft OneHot der ersten Spalte jedes Blocks)
 function filter_by_season(seqs::Vector{<:AbstractMatrix}, season::AbstractString)

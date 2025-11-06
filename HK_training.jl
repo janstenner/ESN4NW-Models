@@ -18,6 +18,9 @@ const SHUFFLE = true
 const NHEADS_WARMUP = 0          # optional: nicht genutzt, Platzhalter
 const SEED = Int(floor(rand()*100000))
 
+const SAVE_DIR_AR = "./saves_HK"
+const SAVE_DIR_FM = "./saves_HK_FM"
+
 using Flux, LinearAlgebra, Random, Statistics
 
 # ---------------------------------------------------------------------------
@@ -82,7 +85,8 @@ function prepare_fm_augmented_batch(X::AbstractArray{<:Real,3}, Y::AbstractArray
 
         # Flow-Token anhängen
         flow_vec = Vector{Float32}(undef, D_IN)
-        make_flow_token_from_template!(flow_vec, @view X[:, end, b], x_t, tidx_next)
+        XX = @view X[:, end, b]
+        make_flow_token_from_template!(flow_vec, XX, x_t, tidx_next)
         X_aug[:, ctx+1, b] = flow_vec
     end
 
@@ -235,21 +239,36 @@ losses = Float32[]
 
 
 
-function load_model(serial = SERIAL)
+function save_model(; serial=SERIAL)
+    @assert @isdefined(model)  "save_model: `model` ist nicht definiert."
+    losses_ = @isdefined(losses) ? losses : Float32[]
 
-    data = FileIO.load("./saves_HK/$(serial).jld2")
-    global model = data["model"]
-    global losses = data["losses"]
+    dir = if model isa FMTransformer
+        SAVE_DIR_FM
+    elseif model isa ARTransformer
+        SAVE_DIR_AR
+    else
+        error("save_model: Unbekannter Modelltyp: $(typeof(model))")
+    end
 
+    isdir(dir) || mkpath(dir)
+    path = joinpath(dir, string(serial, ".jld2"))
+
+    FileIO.save(path,
+        "model",  model,
+        "losses", losses_,
+    )
+    return path
 end
 
-function save_model()
-    isdir("./saves_HK") || mkdir("./saves_HK")
 
+function load_model(path = SAVE_DIR_FM; serial=SERIAL)
 
-    FileIO.save("./saves_HK/$(SERIAL).jld2",
-        "model", model,
-        "losses", losses
-    )
+    path = path * string("/", serial, ".jld2")
 
+    data = FileIO.load(path)
+    global model  = data["model"]
+    global losses = get(data, "losses", Float32[])  # falls älterer Save ohne losses
+
+    return (path=path, mtype=typeof(model))
 end
