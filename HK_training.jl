@@ -7,7 +7,6 @@ using FileIO, JLD2
 # - nutzt HK_model.jl (Decoder-only Transformer mit gaußschem Kopf)
 # - nutzt HK_loader.jl (CSV -> Embeddings -> Fenster -> Minibatches)
 #
-const CTX    = 20
 const SERIAL = "1011089"
 const BASE   = "HK_blocks"
 const BATCH  = 64
@@ -27,13 +26,13 @@ const SAVE_DIR_FM = "./saves_HK_FM"
 const D_IN   = 19          # 4 (Season one-hot) + 2 (sin/cos Zeit) + 13 numerische Kanäle
 const D_OUT  = 13          # Ziel-Dimension: deine 13 kontinuierlichen Kanäle für t+1
 const NUM_IDX = 7:(6 + D_OUT)   # die 13 numerischen Kanäle im D_IN-Token
-const D_MODEL= 64
+const D_MODEL= 128
 const N_HEAD = 4
-const N_LAY  = 4
+const N_LAY  = 6
 const D_FF   = 128
 const DROPOUT= 0.1
 const RANK   = 4           # Low-rank-Kovarianz-Rang
-const MAX_CTX = 30
+const CTX    = 5
 
 using Flux, LinearAlgebra, Random, Statistics
 

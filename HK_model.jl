@@ -198,8 +198,8 @@ function sample_autoregressive(model::ARTransformer = model, x0 = nothing; steps
         x = hcat(x, reshape(xin_next, D_IN, 1, 1))
 
         T = size(x, 2)
-        if T > MAX_CTX
-            x = @view x[:, T - MAX_CTX + 1:T, :]       # SubArray-View: keine Kopie
+        if T > CTX
+            x = @view x[:, T - CTX + 1:T, :]       # SubArray-View: keine Kopie
         end
     end
     return ysamp
@@ -255,10 +255,14 @@ end
 Flux.@layer TEmbedding
 Flux.trainable(te::TEmbedding) = (proj = te.proj,)
 
+function SiLU(x)
+    return x .* (1f0 ./ (1f0 .+ exp.(-x)))
+end
+
 function TEmbedding(d_model = D_MODEL; bands::Int=16, sigma::Float32=16f0)
     B = randn(Float32, bands) .* sigma
     proj = Chain(
-        Dense(2*bands, D_MODEL, x -> x .* (1f0 ./ (1f0 .+ exp.(-x)))),  # SiLU
+        Dense(2*bands, D_MODEL, SiLU),
         Dense(D_MODEL, D_MODEL)
     )
     return TEmbedding(B, proj)
@@ -291,12 +295,12 @@ TypeBias(d_model = D_MODEL) = TypeBias(
 
 
 struct FMTransformer
-    inproj::Dense
+    inproj
     te::TEmbedding
     ttype::TypeBias
     blocks::Vector{DecoderBlock}
     ln_final::LayerNorm
-    head::Dense
+    head
 end
 
 function FMTransformer()
@@ -307,6 +311,7 @@ function FMTransformer()
         TypeBias(),
         blocks,
         LayerNorm(D_MODEL),
+        #Chain(Dense(D_MODEL, D_MODEL, gelu), Dense(D_MODEL, D_OUT))
         Dense(D_MODEL, D_OUT)
     )
 end

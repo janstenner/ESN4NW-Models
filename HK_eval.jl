@@ -130,7 +130,7 @@ end
 function generate_run!(model::FMTransformer, E::AbstractMatrix{<:Real};
                        run_len::Int=500, ctx::Int=20,
                        τ::Float32=1f0,                # nur zur Signatur-Kompatibilität, wird ignoriert
-                       steps::Int=8, solver::Symbol=:midpoint,
+                       steps::Int=38, solver::Symbol=:midpoint,
                        seed::Union{Nothing,Int}=nothing)
 
     T = size(E, 2)
@@ -286,11 +286,24 @@ function traces_for_denorm_mats(real_d::AbstractMatrix, pred_d::AbstractMatrix; 
     @inbounds for j in 1:D
         cname = cols[j]
         col   = colors[j]
+
+        if cname in ("power_mean_kw","power_max_kw","power_min_kw",
+                    "power_avail_wind_mean_kw",
+                    "power_avail_tech_mean_kw",
+                    "power_avail_force_maj_mean_kw",
+                    "power_avail_ext_mean_kw",)
+            yreal = vec(real_d[j, :]) ./100
+            ypred = vec(pred_d[j, :]) ./ 100
+        else
+            yreal = vec(real_d[j, :])
+            ypred = vec(pred_d[j, :])
+        end
+
         # gleiche Farbe, optional legendgroup für saubere Legenden-Gruppierung
-        push!(traces_real, scatter(; x=x, y=vec(real_d[j, :]),
+        push!(traces_real, scatter(; x=x, y=yreal,
                                    mode="lines", name="$cname real",
                                    line=attr(color=col), legendgroup=cname))
-        push!(traces_pred, scatter(; x=x, y=vec(pred_d[j, :]),
+        push!(traces_pred, scatter(; x=x, y=ypred,
                                    mode="lines", name="$cname pred",
                                    line=attr(color=col), legendgroup=cname))
     end
@@ -305,7 +318,7 @@ Return:
 - `results_by_season :: Dict{String, Vector{RunResult}}`
 - `traces_by_season  :: Dict{String, Vector{Vector{AbstractTrace}}}`
 """
-function eval_collect_all(model;
+function eval_collect_all(model=model;
                           serial::AbstractString=SERIAL,
                           base::AbstractString=BASE,
                           ctx::Int=CTX, run_len::Int=500, n_runs::Int=3,
