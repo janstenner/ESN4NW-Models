@@ -251,19 +251,41 @@ end
 # Fallback via get_stats_year(...): (mu=0, sigma=1), falls Eintrag fehlt.
 
 # liefert (real_denorm, pred_denorm) als Float32-Matrizen
-function denorm_mats(rr::RunResult, serial::AbstractString, stats_year; cols=ORDERED_BASE)
+function denorm_mats(rr::RunResult, serial::AbstractString, stats_year;
+                     cols=ORDERED_BASE,
+                     norm::Symbol=:year,
+                     base_dir::Union{Nothing,AbstractString}=nothing,
+                     seasons=("Winter","Fruehling","Sommer","Herbst"),
+                     stats_path_year::Union{Nothing,AbstractString}=nothing)
     D = length(cols)
     L = size(rr.real, 2)
     real_d = Array{Float32}(undef, D, L)
     pred_d = Array{Float32}(undef, D, L)
-    @inbounds for j in 1:D
-        feat = cols[j]
-        st   = get_stats_year(stats_year, String(serial), String(feat))
-        μ    = Float32(st.mu)
-        σ    = Float32(max(st.sigma, 1e-6))
-        # z -> original:  x = z*σ + μ
-        @views real_d[j, :] .= rr.real[j, :] .* σ .+ μ
-        @views pred_d[j, :] .= rr.pred[j, :] .* σ .+ μ
+    if norm === :year_log1p
+        base_dir === nothing && error("base_dir required for :year_log1p denormalization")
+        stats_path = stats_path_year === nothing ? joinpath(base_dir, "stats_by_serial_year.json") : stats_path_year
+        lognorm = build_log1p_norm(base_dir, String(serial);
+                                   seasons=seasons,
+                                   stats_year=stats_year,
+                                   stats_path_year=stats_path)
+        @inbounds for j in 1:D
+            s = lognorm.scale[j]
+            μz = lognorm.mu_z[j]
+            σz = max(lognorm.sig_z[j], 1f-6)
+            @views real_d[j, :] .= s .* (expm1.(rr.real[j, :] .* σz .+ μz))
+            @views pred_d[j, :] .= s .* (expm1.(rr.pred[j, :] .* σz .+ μz))
+            real_d[j, :] .= max.(real_d[j, :], 0f0)
+            pred_d[j, :] .= max.(pred_d[j, :], 0f0)
+        end
+    else
+        @inbounds for j in 1:D
+            feat = cols[j]
+            st   = get_stats_year(stats_year, String(serial), String(feat))
+            μ    = Float32(st.mu)
+            σ    = Float32(max(st.sigma, 1e-6))
+            @views real_d[j, :] .= rr.real[j, :] .* σ .+ μ
+            @views pred_d[j, :] .= rr.pred[j, :] .* σ .+ μ
+        end
     end
     return real_d, pred_d
 end
@@ -311,7 +333,9 @@ function traces_for_denorm_mats(real_d::AbstractMatrix, pred_d::AbstractMatrix; 
 end
 
 """
-    eval_collect_all(model; serial="1011089", base="HK_blocks", ctx=20, run_len=500, n_runs=3, τ=1f0, norm=:year)
+    eval_collect_all(model; serial="1011089", base="HK_blocks", ctx=20,
+                     run_len=500, n_runs=3, τ=1f0, norm=:year,
+                     seasons=("Winter","Fruehling","Sommer","Herbst"))
 
 Lädt `seqs` für `serial`, sammelt pro Season drei 500er-Runs und baut je Run Trace-Arrays.
 Return:
@@ -323,9 +347,13 @@ function eval_collect_all(model=model;
                           base::AbstractString=BASE,
                           ctx::Int=CTX, run_len::Int=500, n_runs::Int=3,
                           τ::Float32=1f0, norm::Symbol=:year,
-                          stats_path_year::AbstractString=joinpath(base, "stats_by_serial_year.json"))
+                          stats_path_year::AbstractString=joinpath(base, "stats_by_serial_year.json"),
+                          seasons=("Winter","Fruehling","Sommer","Herbst"))
     # Daten + Jahres-Stats laden
-    seqs = load_blocks_for_serial(base, serial; norm=norm)
+    seqs = load_blocks_for_serial(base, serial;
+                                  norm=norm,
+                                  seasons=seasons,
+                                  stats_path_year=stats_path_year)
     stats_year = load_stats_year(stats_path_year)
 
     global results_by_season = Dict{String, Vector{RunResult}}()
@@ -343,7 +371,12 @@ function eval_collect_all(model=model;
 
         for r in runs
             # <- Denormalisierung pro Run
-            real_d, pred_d = denorm_mats(r, serial, stats_year; cols=ORDERED_BASE)
+            real_d, pred_d = denorm_mats(r, serial, stats_year;
+                                         cols=ORDERED_BASE,
+                                         norm=norm,
+                                         base_dir=base,
+                                         seasons=seasons,
+                                         stats_path_year=stats_path_year)
             traces_real, traces_pred = traces_for_denorm_mats(real_d, pred_d; cols=ORDERED_BASE)
             push!(trsets_real, traces_real)
             push!(trsets_pred, traces_pred)

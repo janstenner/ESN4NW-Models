@@ -12,6 +12,7 @@ const ORDERED_BASE = [
     "power_avail_force_maj_mean_kw",
     "power_avail_ext_mean_kw",
 ]
+const ORDERED_BASE_SYMBOLS = Symbol.(ORDERED_BASE)
 # const D_OUT = length(ORDERED_BASE)         # 13
 # const D_IN  = 4 + 2 + D_OUT                # 19
 # const SLOTS = 144                          # 10-Minuten-Raster/Tag
@@ -127,41 +128,100 @@ struct Log1pNorm
     sig_z::Vector{Float32}   # Std im log1p-Raum, Länge D_OUT
 end
 
-# baue s_j aus year-stats (original μ,σ), robust und simpel
-function build_scales_from_yearstats(serial::String)
-    st = load_stats_year()             # deine bestehende Funktion
-    ys = st[serial]                    # Dict: feature => (mu, sigma, ...)
-    s = similar(zeros(Float32, D_OUT))
-    @inbounds for (j, name) in enumerate(ORDERED_BASE)
-        μ = Float32(ys[name]["mean"])      # passt an deine JSON-Struktur an
-        σ = Float32(ys[name]["std"])
-        s[j] = max(1f0, μ + 2f0*σ)         # einfache, robuste Skala
+const LOG1P_CACHE = Dict{NTuple{4,String}, Log1pNorm}()
+
+log1p_cache_key(base_dir::AbstractString, serial::AbstractString,
+                seasons, stats_path_year::AbstractString) =
+    (abspath(base_dir),
+     String(serial),
+     join(String.(collect(seasons)), "|"),
+     abspath(stats_path_year))
+
+function gather_block_entries(base_dir::AbstractString, serial::AbstractString, seasons)
+    entries = Tuple{String,Vector{String}}[]
+    for s in seasons
+        dir_s = joinpath(base_dir, s, serial)
+        isdir(dir_s) || continue
+        files = sort(glob("*.csv", dir_s))
+        isempty(files) && continue
+        push!(entries, (String(s), files))
     end
-    return s
+    return entries
 end
 
-# berechne μ_z, σ_z im log1p-Raum über alle Blöcke (ein Pass)
-function compute_log1p_stats(seqs::Vector{Matrix{Float32}}, scale::Vector{Float32})
-    # Welford
-    μz = zeros(Float32, D_OUT)
-    M2 = zeros(Float32, D_OUT)
-    n  = 0
-    @inbounds for E in seqs
-        Y = @view E[7:6+D_OUT, :]                # (D_OUT, T)
-        Z = log1p.(Y ./ scale)                   # broadcasted
-        for j in 1:D_OUT
-            zrow = @view Z[j, :]
-            for k in 1:length(zrow)
-                n   += 1
-                δ    = zrow[k] - μz[j]
-                μz[j] += δ / n
-                M2[j] += δ * (zrow[k] - μz[j])
+function build_log1p_scale(stats_year::Dict{String,<:Any}, serial::String)
+    scale = Vector{Float32}(undef, D_OUT)
+    @inbounds for (i, feat) in enumerate(ORDERED_BASE)
+        st = get_stats_year(stats_year, serial, feat)
+        μ = Float32(max(st.mu, 0.0))
+        σ = Float32(max(st.sigma, 1e-6))
+        candidate = μ + 3f0*σ
+        scale[i] = candidate > 1f-3 ? candidate : 1f0
+    end
+    return scale
+end
+
+function compute_log1p_stats_from_files(files::Vector{String}, scale::Vector{Float32})
+    μ = zeros(Float64, D_OUT)
+    m2 = zeros(Float64, D_OUT)
+    counts = zeros(Int, D_OUT)
+    scale64 = Float64.(scale)
+    for file in files
+        df = CSV.read(file, DataFrame; normalizenames=false)
+        for row in eachrow(df)
+            @inbounds for (j, sym) in enumerate(ORDERED_BASE_SYMBOLS)
+                raw = row[sym]
+                if raw === missing
+                    continue
+                end
+                val = Float64(raw)
+                if !isfinite(val)
+                    continue
+                end
+                val = max(val, 0.0)
+                z = log1p(val / scale64[j])
+                counts[j] += 1
+                δ = z - μ[j]
+                μ[j] += δ / counts[j]
+                m2[j] += δ * (z - μ[j])
             end
         end
     end
-    sig = sqrt.(M2 ./ max(n-1, 1))
-    sig .= replace!(sig, 0f0=>1f0)               # Schutz
-    return μz, sig
+    mu_z = Vector{Float32}(undef, D_OUT)
+    sig_z = Vector{Float32}(undef, D_OUT)
+    @inbounds for j in 1:D_OUT
+        mu_z[j] = Float32(counts[j] == 0 ? 0.0 : μ[j])
+        if counts[j] > 1
+            σ = sqrt(m2[j] / (counts[j] - 1))
+            sig_z[j] = σ > 1f-6 ? Float32(σ) : 1f0
+        else
+            sig_z[j] = 1f0
+        end
+    end
+    return mu_z, sig_z
+end
+
+function build_log1p_norm(base_dir::AbstractString, serial::AbstractString;
+                          seasons = ("Winter","Fruehling","Sommer","Herbst"),
+                          stats_year::Union{Nothing,Dict}=nothing,
+                          stats_path_year::AbstractString = joinpath(base_dir, "stats_by_serial_year.json"),
+                          block_entries::Union{Nothing,Vector{Tuple{String,Vector{String}}}}=nothing)
+    key = log1p_cache_key(base_dir, serial, seasons, stats_path_year)
+    if haskey(LOG1P_CACHE, key)
+        return LOG1P_CACHE[key]
+    end
+    stats = isnothing(stats_year) ? load_stats_year(stats_path_year) : stats_year
+    entries = isnothing(block_entries) ? gather_block_entries(base_dir, serial, seasons) : block_entries
+    files = String[]
+    for (_, flist) in entries
+        append!(files, flist)
+    end
+    isempty(files) && error("No CSV files found for serial=$serial under $base_dir")
+    scale = build_log1p_scale(stats, String(serial))
+    mu_z, sig_z = compute_log1p_stats_from_files(files, scale)
+    ln = Log1pNorm(scale, mu_z, sig_z)
+    LOG1P_CACHE[key] = ln
+    return ln
 end
 
 # vorwärts/invers für einen (D_OUT, T)-Block
@@ -274,7 +334,8 @@ end
 - normalisiert ORDERED_BASE mit stats[(season, serial, feat)].
 """
 function embed_row(row, serial::String, stats;
-                   norm::Symbol = :year)
+                   norm::Symbol = :year,
+                   lognorm::Union{Nothing,Log1pNorm}=nothing)
     # Zeit/Season
     dt = row[:time] isa DateTime ? row[:time] : DateTime(row[:time])
     s  = season_str(dt)
@@ -285,12 +346,23 @@ function embed_row(row, serial::String, stats;
     z = Vector{Float32}(undef, D_OUT)
     @inbounds for (i, feat) in enumerate(ORDERED_BASE)
         v = row[Symbol(feat)]
-        v = (v === missing) ? NaN : v
-        ms = norm === :season ? get_stats(stats, s, serial, feat) :
-             norm === :year   ? get_stats_year(stats, serial, feat) :
-             error("Unknown norm mode: $norm")
-        σ  = max(ms.sigma, 1e-6)
-        z[i] = Float32((Float64(v) - ms.mu) / σ)
+        if norm === :year_log1p
+            isnothing(lognorm) && error("lognorm params missing for :year_log1p mode")
+            val = v === missing ? 0.0f0 : Float32(v)
+            val = ifelse(isfinite(val), val, 0.0f0)
+            val = max(val, 0f0)
+            s_j  = lognorm.scale[i]
+            μz   = lognorm.mu_z[i]
+            σz   = max(lognorm.sig_z[i], 1f-6)
+            z[i] = (log1p(val / s_j) - μz) / σz
+        else
+            v = (v === missing) ? NaN : v
+            ms = norm === :season ? get_stats(stats, s, serial, feat) :
+                 norm === :year   ? get_stats_year(stats, serial, feat) :
+                 error("Unknown norm mode: $norm")
+            σ  = max(ms.sigma, 1e-6)
+            z[i] = Float32((Float64(v) - ms.mu) / σ)
+        end
     end
 
     emb = Vector{Float32}(undef, D_IN)
@@ -313,34 +385,45 @@ function load_blocks_for_serial(base_dir::AbstractString, serial::AbstractString
                                 stats_path::AbstractString = joinpath(base_dir, "stats_by_season_serial.json"),
                                 norm::Symbol = :year_log1p,
                                 stats_path_year::AbstractString = joinpath(base_dir, "stats_by_serial_year.json"))
-    # Stats laden je nach Modus
+    serial_str = String(serial)
+    block_entries = gather_block_entries(base_dir, serial_str, seasons)
+
+    global seqs
+    seqs = Vector{Matrix{Float32}}()
+    isempty(block_entries) && return seqs
+
     stats = nothing
+    stats_year = nothing
+    lognorm = nothing
+
     if norm === :season
         stats = load_stats(stats_path)
     elseif norm === :year
-        stats = load_stats_year(stats_path_year)
-    elseif norm == :year_log1p
-        stats      = build_scales_from_yearstats(serial)
-        # μz, σz = compute_log1p_stats(seqs, s)  <-- das geht schon nicht mehr, da seqs nicht existiert
+        stats_year = load_stats_year(stats_path_year)
+        stats = stats_year
+    elseif norm === :year_log1p
+        stats_year = load_stats_year(stats_path_year)
+        stats = stats_year
+        lognorm = build_log1p_norm(base_dir, serial_str;
+                                   seasons=seasons,
+                                   stats_year=stats_year,
+                                   stats_path_year=stats_path_year,
+                                   block_entries=block_entries)
     else
         error("Unknown norm mode: $norm")
     end
 
-    global seqs
-    seqs  = Vector{Matrix{Float32}}()
-    for s in seasons
-        dir_s = joinpath(base_dir, s, serial)
-        isdir(dir_s) || continue
-        for f in sort(glob("*.csv", dir_s))
+    for (_, files) in block_entries
+        for f in files
             df = CSV.read(f, DataFrame; normalizenames=false)
             @assert "time" ∈ names(df) "Spalte 'time' fehlt in $f"
             T = nrow(df)
             E = Matrix{Float32}(undef, D_IN, T)
             @inbounds for t in 1:T
                 row = df[t, :]
-                E[:, t] = embed_row(row, String(serial),
-                                    stats;
-                                    norm=norm)
+                E[:, t] = embed_row(row, serial_str, stats;
+                                    norm=norm,
+                                    lognorm=lognorm)
             end
             push!(seqs, E)
         end
