@@ -82,7 +82,7 @@ end
 Liest `serial -> feat -> {mu, sigma, n}` und gibt
 `stats_year[serial][feat] => (mu::Float64, sigma::Float64)` zurück.
 """
-function load_stats_year(json_path::AbstractString)
+function load_stats_year(json_path::AbstractString = joinpath(base_dir, "stats_by_serial_year.json"))
     raw = JSON3.read(read(json_path, String))
     stats = Dict{String, Dict{String, NamedTuple{(:mu,:sigma),Tuple{Float64,Float64}}}}()
     for (serial, feats) in pairs(raw)
@@ -117,6 +117,63 @@ function load_stats_flexible(json_path::AbstractString)
     else                                       # Year-Form (serial -> feat)
         return (:year, load_stats_year(json_path))
     end
+end
+
+
+# --- Log1p-Normalizer ---------------------------------------------------------
+struct Log1pNorm
+    scale::Vector{Float32}   # s_j > 0, Länge D_OUT
+    mu_z::Vector{Float32}    # Mittel im log1p-Raum, Länge D_OUT
+    sig_z::Vector{Float32}   # Std im log1p-Raum, Länge D_OUT
+end
+
+# baue s_j aus year-stats (original μ,σ), robust und simpel
+function build_scales_from_yearstats(serial::String)
+    st = load_stats_year()             # deine bestehende Funktion
+    ys = st[serial]                    # Dict: feature => (mu, sigma, ...)
+    s = similar(zeros(Float32, D_OUT))
+    @inbounds for (j, name) in enumerate(ORDERED_BASE)
+        μ = Float32(ys[name]["mean"])      # passt an deine JSON-Struktur an
+        σ = Float32(ys[name]["std"])
+        s[j] = max(1f0, μ + 2f0*σ)         # einfache, robuste Skala
+    end
+    return s
+end
+
+# berechne μ_z, σ_z im log1p-Raum über alle Blöcke (ein Pass)
+function compute_log1p_stats(seqs::Vector{Matrix{Float32}}, scale::Vector{Float32})
+    # Welford
+    μz = zeros(Float32, D_OUT)
+    M2 = zeros(Float32, D_OUT)
+    n  = 0
+    @inbounds for E in seqs
+        Y = @view E[7:6+D_OUT, :]                # (D_OUT, T)
+        Z = log1p.(Y ./ scale)                   # broadcasted
+        for j in 1:D_OUT
+            zrow = @view Z[j, :]
+            for k in 1:length(zrow)
+                n   += 1
+                δ    = zrow[k] - μz[j]
+                μz[j] += δ / n
+                M2[j] += δ * (zrow[k] - μz[j])
+            end
+        end
+    end
+    sig = sqrt.(M2 ./ max(n-1, 1))
+    sig .= replace!(sig, 0f0=>1f0)               # Schutz
+    return μz, sig
+end
+
+# vorwärts/invers für einen (D_OUT, T)-Block
+@inline function fwd_log1p_zscore!(Y::AbstractMatrix{Float32}, ln::Log1pNorm)
+    @views Y .= (log1p.(Y ./ ln.scale) .- ln.mu_z) ./ ln.sig_z
+    return Y
+end
+
+@inline function inv_log1p_zscore!(Y::AbstractMatrix{Float32}, ln::Log1pNorm)
+    @views Y .= ln.scale .* (expm1.(Y .* ln.sig_z .+ ln.mu_z))
+    Y .= max.(Y, 0f0)   # nur für numerische Sicherheit
+    return Y
 end
 
 
@@ -204,9 +261,7 @@ function aggregate_year_stats(in_json::AbstractString, out_json::AbstractString=
     println("Wrote ", out_json)
 end
 
-# inpath  = length(ARGS) >= 1 ? ARGS[1] : "HK_blocks/stats_by_season_serial.json"
-# outpath = length(ARGS) >= 2 ? ARGS[2] : "HK_blocks/stats_by_serial_year.json"
-# aggregate_year_stats(inpath, outpath)
+
 
 
 
@@ -256,7 +311,7 @@ Liest alle CSVs unter `base_dir/Season/serial/*.csv`, baut pro CSV ein
 function load_blocks_for_serial(base_dir::AbstractString, serial::AbstractString;
                                 seasons = ("Winter","Fruehling","Sommer","Herbst"),
                                 stats_path::AbstractString = joinpath(base_dir, "stats_by_season_serial.json"),
-                                norm::Symbol = :year,
+                                norm::Symbol = :year_log1p,
                                 stats_path_year::AbstractString = joinpath(base_dir, "stats_by_serial_year.json"))
     # Stats laden je nach Modus
     stats = nothing
@@ -264,6 +319,9 @@ function load_blocks_for_serial(base_dir::AbstractString, serial::AbstractString
         stats = load_stats(stats_path)
     elseif norm === :year
         stats = load_stats_year(stats_path_year)
+    elseif norm == :year_log1p
+        stats      = build_scales_from_yearstats(serial)
+        # μz, σz = compute_log1p_stats(seqs, s)  <-- das geht schon nicht mehr, da seqs nicht existiert
     else
         error("Unknown norm mode: $norm")
     end

@@ -1,8 +1,6 @@
 using CSV, DataFrames, Statistics, Printf
 
-# ---------------- Config ----------------
-const BASE_DIR  = length(ARGS) >= 1 ? ARGS[1] : "HK_blocks"
-const OUT_CSV   = length(ARGS) >= 2 ? ARGS[2] : "stats_by_season_2.csv"
+
 
 # exakt wie in deinem finalen Scraper:
 const NUMERIC_COLS = [
@@ -31,6 +29,12 @@ Welford() = Welford(0, 0.0, 0.0)
     w.mean += δ / w.n
     δ2  = x - w.mean
     w.m2 += δ * δ2
+
+    if isnan(w.mean) || isnan(w.m2)
+        @show x, w.n, w.mean, w.m2
+        error("A")
+    end
+
     return w
 end
 
@@ -43,7 +47,7 @@ end
 end
 
 # (season, serial, feature) -> accumulator
-const ACC = Dict{Tuple{String,String,String}, Welford}()
+ACC = Dict{Tuple{String,String,String}, Welford}()
 
 @inline function acc_ref(season::String, serial::String, feat::String)
     get!(ACC, (season, serial, feat)) do
@@ -83,7 +87,8 @@ function season_from_path(path::AbstractString)
 end
 
 # -------------- Main --------------------
-function main()
+function compute_log_stats(BASE_DIR  = "HK_blocks", out_json   = "HK_blocks/log_stats_by_serial_year.json")
+    global ACC = Dict{Tuple{String,String,String}, Welford}()
     files = list_csvs(BASE_DIR)
     println("Gefundene CSV-Blöcke: ", length(files))
 
@@ -139,7 +144,9 @@ function main()
                         @show p, i
                     end
 
-                    update!(acc_ref(season, serial, c), Float64(x))
+                    isnan(log(x)) && @show x
+
+                    update!(acc_ref(season, serial, c), Float64(log(x)))
                     num_vals += 1
                 end
             end
@@ -156,15 +163,20 @@ function main()
         stats = finalize(w)
         push!(rows, (s, sn, f, stats.μ, stats.σ, stats.n))
     end
-    outdf = DataFrame(rows)
+    global outdf = DataFrame(rows)
     sort!(outdf, [:season, :serial, :feature])
 
-    CSV.write(OUT_CSV, outdf)
-    println("Geschrieben: ", OUT_CSV)
+
+    open(out_json, "w") do io
+        #JSON3.write(io, out; allow_inf=true, indent=2)
+        JSON3.pretty(io, JSON3.write(outdf))
+    end
+    println("Wrote ", out_json)
+
+    # CSV.write(OUT_CSV, outdf)
+    # println("Geschrieben: ", OUT_CSV)
 
     # optional: schnelle Ausreißer-Sicht (sehr grob)
     # show(first(sort(outdf, :sigma, rev=true), 20), allcols=true, truncate=120)
 end
 
-
-main()

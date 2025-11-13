@@ -515,4 +515,16 @@ open(joinpath(OUT_DIR, "stats_by_season_serial.json"), "w") do io
 end
 println("Stats gespeichert: ", joinpath(OUT_DIR, "stats_by_season_serial.json"))
 
+
+include("HK_loader.jl")
+
+inpath  = "HK_blocks/stats_by_season_serial.json"
+outpath = "HK_blocks/stats_by_serial_year.json"
+aggregate_year_stats(inpath, outpath)
+
+# include("log_stats.jl")
+# compute_log_stats()
+
+
+
 println("Fertig. Gesamt gespeicherte Blöcke: $total_blocks")
