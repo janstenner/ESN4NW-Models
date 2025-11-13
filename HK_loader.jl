@@ -128,26 +128,14 @@ struct Log1pNorm
     sig_z::Vector{Float32}   # Std im log1p-Raum, Länge D_OUT
 end
 
-const LOG1P_CACHE = Dict{NTuple{4,String}, Log1pNorm}()
+const LOG1P_CACHE = Dict{Tuple{String,String}, Log1pNorm}() # (abs_base, serial)
 const LOG1P_CACHE_LOADED = Set{String}()
 
-log1p_cache_key(base_dir::AbstractString, serial::AbstractString,
-                seasons, stats_path_year::AbstractString) =
-    (abspath(base_dir),
-     String(serial),
-     join(String.(collect(seasons)), "|"),
-     abspath(stats_path_year))
+log1p_cache_key(base_dir::AbstractString, serial::AbstractString) =
+    (abspath(base_dir), String(serial))
 
 log1p_cache_file(base_dir::AbstractString) =
     joinpath(abspath(base_dir), "stats_log1p_cache.json")
-
-@inline serialize_log1p_key(key::NTuple{4,String}) = join(key, "||")
-
-function deserialize_log1p_key(keystr::AbstractString)
-    parts = split(keystr, "||")
-    length(parts) == 4 || error("Invalid log1p cache key: $keystr")
-    return (String(parts[1]), String(parts[2]), String(parts[3]), String(parts[4]))
-end
 
 function ensure_log1p_cache_loaded!(base_dir::AbstractString)
     abs_base = abspath(base_dir)
@@ -155,12 +143,40 @@ function ensure_log1p_cache_loaded!(base_dir::AbstractString)
     path = log1p_cache_file(base_dir)
     if isfile(path)
         raw = JSON3.read(read(path, String))
-        for (ks, obj) in pairs(raw)
-            key = deserialize_log1p_key(String(ks))
-            scale = Float32.(obj["scale"])
-            mu_z  = Float32.(obj["mu_z"])
-            sig_z = Float32.(obj["sig_z"])
-            LOG1P_CACHE[key] = Log1pNorm(collect(scale), collect(mu_z), collect(sig_z))
+        if raw isa AbstractString
+            raw = JSON3.read(String(raw))
+        end
+        if isempty(raw)
+            # nothing to do
+        else
+            sample_val = first(raw)[2]
+            if sample_val isa AbstractDict && haskey(sample_val, "scale")
+                # legacy flat format keyed by serialized tuple
+                for (ks, obj) in pairs(raw)
+                    parts = split(String(ks), "||")
+                    serial = length(parts) >= 2 ? parts[2] : String(ks)
+                    scale = Float32.(obj["scale"])
+                    mu_z  = Float32.(obj["mu_z"])
+                    sig_z = Float32.(obj["sig_z"])
+                    LOG1P_CACHE[(abs_base, serial)] = Log1pNorm(collect(scale), collect(mu_z), collect(sig_z))
+                end
+            else
+                # new structured format: serial -> feat -> {scale, mu_z, sig_z}
+                for (serial, feats) in pairs(raw)
+                    scale = Vector{Float32}(undef, D_OUT)
+                    mu_z  = Vector{Float32}(undef, D_OUT)
+                    sig_z = Vector{Float32}(undef, D_OUT)
+                    @inbounds for (i, feat) in enumerate(ORDERED_BASE)
+                        obj = get(feats, feat) do
+                            Dict("scale"=>1.0, "mu_z"=>0.0, "sig_z"=>1.0)
+                        end
+                        scale[i] = Float32(get(obj, "scale", 1.0))
+                        mu_z[i]  = Float32(get(obj, "mu_z", 0.0))
+                        sig_z[i] = Float32(max(get(obj, "sig_z", 1.0), 1f-6))
+                    end
+                    LOG1P_CACHE[(abs_base, String(serial))] = Log1pNorm(scale, mu_z, sig_z)
+                end
+            end
         end
     end
     push!(LOG1P_CACHE_LOADED, abs_base)
@@ -168,19 +184,23 @@ end
 
 function persist_log1p_cache!(base_dir::AbstractString)
     abs_base = abspath(base_dir)
-    data = Dict{String, Dict{String, Vector{Float64}}}()
-    for (key, ln) in LOG1P_CACHE
-        key[1] == abs_base || continue
-        data[serialize_log1p_key(key)] = Dict(
-            "scale" => collect(Float64.(ln.scale)),
-            "mu_z"  => collect(Float64.(ln.mu_z)),
-            "sig_z" => collect(Float64.(ln.sig_z)),
-        )
+    data = Dict{String, Dict{String, Dict{String, Float64}}}()
+    for ((b, serial), ln) in LOG1P_CACHE
+        b == abs_base || continue
+        feats = Dict{String, Dict{String, Float64}}()
+        @inbounds for (i, feat) in enumerate(ORDERED_BASE)
+            feats[feat] = Dict(
+                "scale" => Float64(ln.scale[i]),
+                "mu_z"  => Float64(ln.mu_z[i]),
+                "sig_z" => Float64(ln.sig_z[i]),
+            )
+        end
+        data[serial] = feats
     end
     path = log1p_cache_file(base_dir)
     try
         open(path, "w") do io
-            JSON3.pretty(io, JSON3.write(data))
+            JSON3.pretty(io, data)
         end
     catch err
         @warn "Failed to persist log1p cache" path err
@@ -257,7 +277,7 @@ function build_log1p_norm(base_dir::AbstractString, serial::AbstractString;
                           stats_path_year::AbstractString = joinpath(base_dir, "stats_by_serial_year.json"),
                           block_entries::Union{Nothing,Vector{Tuple{String,Vector{String}}}}=nothing)
     ensure_log1p_cache_loaded!(base_dir)
-    key = log1p_cache_key(base_dir, serial, seasons, stats_path_year)
+    key = log1p_cache_key(base_dir, serial)
     if haskey(LOG1P_CACHE, key)
         return LOG1P_CACHE[key]
     end
