@@ -183,7 +183,7 @@ function train!(model; epochs::Int=EPOCHS, lr::Float32=LR, batch::Int=BATCH, ctx
                 shuffle::Bool=SHUFFLE, seed::Int=SEED)
 
     Random.seed!(seed)
-    seqs   = load_blocks_for_serial(base, serial; norm=:year)
+    seqs   = load_blocks_for_serial(base, serial; norm=:year_log1p)
     loader = make_loader(seqs; ctx=ctx, batchsize=batch, shuffle=shuffle)
 
     opt    = Flux.setup(Flux.AdamW(lr), model)

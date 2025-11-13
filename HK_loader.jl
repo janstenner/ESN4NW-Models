@@ -129,6 +129,7 @@ struct Log1pNorm
 end
 
 const LOG1P_CACHE = Dict{NTuple{4,String}, Log1pNorm}()
+const LOG1P_CACHE_LOADED = Set{String}()
 
 log1p_cache_key(base_dir::AbstractString, serial::AbstractString,
                 seasons, stats_path_year::AbstractString) =
@@ -136,6 +137,55 @@ log1p_cache_key(base_dir::AbstractString, serial::AbstractString,
      String(serial),
      join(String.(collect(seasons)), "|"),
      abspath(stats_path_year))
+
+log1p_cache_file(base_dir::AbstractString) =
+    joinpath(abspath(base_dir), "stats_log1p_cache.json")
+
+@inline serialize_log1p_key(key::NTuple{4,String}) = join(key, "||")
+
+function deserialize_log1p_key(keystr::AbstractString)
+    parts = split(keystr, "||")
+    length(parts) == 4 || error("Invalid log1p cache key: $keystr")
+    return (String(parts[1]), String(parts[2]), String(parts[3]), String(parts[4]))
+end
+
+function ensure_log1p_cache_loaded!(base_dir::AbstractString)
+    abs_base = abspath(base_dir)
+    abs_base in LOG1P_CACHE_LOADED && return
+    path = log1p_cache_file(base_dir)
+    if isfile(path)
+        raw = JSON3.read(read(path, String))
+        for (ks, obj) in pairs(raw)
+            key = deserialize_log1p_key(String(ks))
+            scale = Float32.(obj["scale"])
+            mu_z  = Float32.(obj["mu_z"])
+            sig_z = Float32.(obj["sig_z"])
+            LOG1P_CACHE[key] = Log1pNorm(collect(scale), collect(mu_z), collect(sig_z))
+        end
+    end
+    push!(LOG1P_CACHE_LOADED, abs_base)
+end
+
+function persist_log1p_cache!(base_dir::AbstractString)
+    abs_base = abspath(base_dir)
+    data = Dict{String, Dict{String, Vector{Float64}}}()
+    for (key, ln) in LOG1P_CACHE
+        key[1] == abs_base || continue
+        data[serialize_log1p_key(key)] = Dict(
+            "scale" => collect(Float64.(ln.scale)),
+            "mu_z"  => collect(Float64.(ln.mu_z)),
+            "sig_z" => collect(Float64.(ln.sig_z)),
+        )
+    end
+    path = log1p_cache_file(base_dir)
+    try
+        open(path, "w") do io
+            JSON3.pretty(io, JSON3.write(data))
+        end
+    catch err
+        @warn "Failed to persist log1p cache" path err
+    end
+end
 
 function gather_block_entries(base_dir::AbstractString, serial::AbstractString, seasons)
     entries = Tuple{String,Vector{String}}[]
@@ -206,6 +256,7 @@ function build_log1p_norm(base_dir::AbstractString, serial::AbstractString;
                           stats_year::Union{Nothing,Dict}=nothing,
                           stats_path_year::AbstractString = joinpath(base_dir, "stats_by_serial_year.json"),
                           block_entries::Union{Nothing,Vector{Tuple{String,Vector{String}}}}=nothing)
+    ensure_log1p_cache_loaded!(base_dir)
     key = log1p_cache_key(base_dir, serial, seasons, stats_path_year)
     if haskey(LOG1P_CACHE, key)
         return LOG1P_CACHE[key]
@@ -221,6 +272,7 @@ function build_log1p_norm(base_dir::AbstractString, serial::AbstractString;
     mu_z, sig_z = compute_log1p_stats_from_files(files, scale)
     ln = Log1pNorm(scale, mu_z, sig_z)
     LOG1P_CACHE[key] = ln
+    persist_log1p_cache!(base_dir)
     return ln
 end
 

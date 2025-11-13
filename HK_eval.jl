@@ -253,7 +253,7 @@ end
 # liefert (real_denorm, pred_denorm) als Float32-Matrizen
 function denorm_mats(rr::RunResult, serial::AbstractString, stats_year;
                      cols=ORDERED_BASE,
-                     norm::Symbol=:year,
+                     norm::Symbol=:year_log1p,
                      base_dir::Union{Nothing,AbstractString}=nothing,
                      seasons=("Winter","Fruehling","Sommer","Herbst"),
                      stats_path_year::Union{Nothing,AbstractString}=nothing)
@@ -334,7 +334,7 @@ end
 
 """
     eval_collect_all(model; serial="1011089", base="HK_blocks", ctx=20,
-                     run_len=500, n_runs=3, τ=1f0, norm=:year,
+                     run_len=500, n_runs=3, τ=1f0, norm=:year_log1p,
                      seasons=("Winter","Fruehling","Sommer","Herbst"))
 
 Lädt `seqs` für `serial`, sammelt pro Season drei 500er-Runs und baut je Run Trace-Arrays.
@@ -346,7 +346,7 @@ function eval_collect_all(model=model;
                           serial::AbstractString=SERIAL,
                           base::AbstractString=BASE,
                           ctx::Int=CTX, run_len::Int=500, n_runs::Int=3,
-                          τ::Float32=1f0, norm::Symbol=:year,
+                          τ::Float32=1f0, norm::Symbol=:year_log1p,
                           stats_path_year::AbstractString=joinpath(base, "stats_by_serial_year.json"),
                           seasons=("Winter","Fruehling","Sommer","Herbst"))
     # Daten + Jahres-Stats laden
