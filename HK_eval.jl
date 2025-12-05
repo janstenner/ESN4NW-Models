@@ -405,11 +405,37 @@ function generate_year_csv(model;
     println("→ Plot erstelle …")
     traces_real, traces_pred = traces_for_denorm_mats(year_mat, year_mat; cols=ORDERED_BASE)
     p = plot(vcat(traces_real, traces_pred))
-    
     display(p)
 
     println("→ Fertig. Gesamt-Slots: $n, Datei: $output_path")
     return output_path
+end
+
+"""
+    plot_generated_csv(path="generated_year.csv")
+
+Liest eine zuvor erzeugte Jahres-CSV (z.B. via `generate_year_csv`) und plottet
+alle Kanäle analog zu `traces_for_denorm_mats`.
+"""
+function plot_generated_csv(path::AbstractString="generated_year.csv")
+    println("→ Lade CSV aus $path …")
+    df = CSV.read(path, DataFrame; normalizenames=false)
+    @assert "time" in names(df) "Spalte 'time' fehlt in CSV."
+    for feat in ORDERED_BASE
+        @assert feat in names(df) "Spalte $feat fehlt in CSV."
+    end
+
+    n = nrow(df)
+    mat = Array{Float64}(undef, D_OUT, n)
+    @inbounds for (j, feat) in enumerate(ORDERED_BASE)
+        mat[j, :] .= Float64.(df[!, feat])
+    end
+
+    println("→ Erzeuge Plot …")
+    traces_real, traces_pred = traces_for_denorm_mats(mat, mat; cols=ORDERED_BASE)
+    p = plot(vcat(traces_real, traces_pred))
+    display(p)
+    return p
 end
 
 
