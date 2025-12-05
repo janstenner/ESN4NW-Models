@@ -1,6 +1,8 @@
 /.vscode
 /Manifest.toml
 
+generated_year.csv
+
 Entwärmungsmessung/*
 HK_blocks/*
 HK_complete/*

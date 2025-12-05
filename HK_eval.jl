@@ -152,67 +152,164 @@ function build_year_slot_timeline(year::Int)
     return times, seasons_for_slot
 end
 
-# Generiert z-normalisierte Runs stückweise, denormalisiert sie sofort und
-# füllt einen (D_OUT, slots_needed)-Puffer.
-function generate_denormed_season_slots!(dest::AbstractMatrix{Float32},
-                                         model,
-                                         seqs::Vector{<:AbstractMatrix},
-                                         stats_year;
-                                         season::AbstractString,
-                                         serial::AbstractString=SERIAL,
-                                         base_dir::AbstractString=BASE,
-                                         stats_path_year::AbstractString=joinpath(base_dir, "stats_by_serial_year.json"),
-                                         seasons=SEASON_NAMES,
-                                         norm::Symbol=:year_log1p,
-                                         ctx::Int=CTX,
-                                         τ::Float32=1f0,
-                                         chunk_slots::Int=2000,
-                                         fm_steps::Int=38,
-                                         fm_solver::Symbol=:midpoint)
+@inline function season_onehot_vec(s::AbstractString)
+    oh = season_onehot(s)
+    return Float32.(collect(oh))
+end
+
+function pick_random_context(seqs::Vector{<:AbstractMatrix}, season::AbstractString; ctx::Int=CTX)
     idxs = filter_by_season(seqs, season)
     @assert !isempty(idxs) "Keine Blöcke für Season=$season gefunden."
-
-    max_run_len = maximum(size(seqs[i], 2) - ctx for i in idxs)
-    @assert max_run_len > 0 "Sequenzen für Season=$season sind kürzer als ctx=$ctx."
-    chunk = min(chunk_slots, max_run_len)
-
-    filled = 0
-    total = size(dest, 2)
-
-    while filled < total
-        run_len = min(chunk, total - filled)
-        rr = nothing
-        for _ in 1:200
-            si = rand(idxs)
-            E  = seqs[si]
-            if size(E, 2) >= ctx + run_len
-                if model isa FMTransformer
-                    rr = generate_run!(model, E; run_len=run_len, ctx=ctx, τ=τ, steps=fm_steps, solver=fm_solver)
-                else
-                    rr = generate_run!(model, E; run_len=run_len, ctx=ctx, τ=τ)
-                end
-                rr.seq_id = si
-                break
-            end
+    for _ in 1:200
+        si = rand(idxs)
+        E = seqs[si]
+        T = size(E, 2)
+        T >= ctx && begin
+            s = rand(1:(T-ctx+1))
+            return Array{Float32}(E[:, s:s+ctx-1])
         end
-        rr === nothing && error("Finde keinen ausreichend langen Block für Season=$season, run_len=$run_len.")
-
-        _, pred_d = denorm_mats(rr, serial, stats_year;
-                                cols=ORDERED_BASE,
-                                norm=norm,
-                                base_dir=base_dir,
-                                seasons=seasons,
-                                stats_path_year=stats_path_year)
-        dest[:, filled+1 : filled+run_len] .= pred_d[:, 1:run_len]
-        filled += run_len
     end
-    return dest
+    error("Finde keinen ausreichend langen Kontext (ctx=$ctx) für Season=$season.")
+end
+
+function reset_context_time!(ctx_mat::AbstractMatrix{<:Real})
+    ctx = size(ctx_mat, 2)
+    start_slot = max(1, SLOTS - ctx + 1)
+    slot = start_slot
+    @inbounds for col in 1:ctx
+        ctx_mat[5, col] = TIME_LUT[1, slot]
+        ctx_mat[6, col] = TIME_LUT[2, slot]
+        slot += 1
+    end
+    return ctx_mat
+end
+
+function retag_context(ctx_mat::AbstractMatrix{<:Real}, season::AbstractString; reset_time::Bool=true)
+    ctx_out = Array{Float32}(ctx_mat)
+    oh = season_onehot_vec(season)
+    @inbounds for col in 1:size(ctx_out, 2)
+        ctx_out[1:4, col] .= oh
+    end
+    reset_time && reset_context_time!(ctx_out)
+    return ctx_out
+end
+
+function generate_from_context(model::ARTransformer,
+                               ctx_mat::AbstractMatrix{<:Real};
+                               run_len::Int,
+                               τ::Float32=1f0)
+    ctx = size(ctx_mat, 2)
+    X = reshape(Float32.(ctx_mat), D_IN, ctx, 1)
+    s0 = X[5, end, 1]; c0 = X[6, end, 1]
+    t_idx = nearest_slot_from_sc(s0, c0)
+
+    pred = Array{Float32}(undef, D_OUT, run_len)
+    real = zeros(Float32, D_OUT, run_len)
+
+    @inbounds for i in 1:run_len
+        μ, logσ, U = model(X)
+        μt    = vec(μ[:, end, 1])
+        logσt = vec(logσ[:, end, 1])
+        Ut    = Array(U[:, :, end, 1])
+
+        ŷ = sample_factor_tau(μt, logσt, Ut; τ=τ)
+        pred[:, i] = ŷ
+
+        xin = X[:, end, 1]
+        xin_next, t_idx = build_input_from_prediction(xin, ŷ, t_idx)
+        xin_next3 = reshape(xin_next, D_IN, 1, 1)
+
+        if size(X, 2) < ctx
+            X = hcat(X, xin_next3)
+        else
+            X = cat(@view(X[:, 2:end, :]), xin_next3; dims=2)
+        end
+    end
+
+    season = season_from_onehot(@view X[1:4, 1, 1])
+    rr = RunResult(season, 0, 1, real, pred)
+    last_ctx = Array{Float32}(X[:, :, 1])
+    return rr, last_ctx
+end
+
+function generate_from_context(model::FMTransformer,
+                               ctx_mat::AbstractMatrix{<:Real};
+                               run_len::Int,
+                               τ::Float32=1f0,              # kept for signature parity
+                               steps::Int=38,
+                               solver::Symbol=:midpoint,
+                               seed::Union{Nothing,Int}=nothing)
+    ctx = size(ctx_mat, 2)
+    X = reshape(Float32.(ctx_mat), D_IN, ctx, 1)
+    s0 = X[5, end, 1]; c0 = X[6, end, 1]
+    t_idx = nearest_slot_from_sc(s0, c0)
+
+    pred = Array{Float32}(undef, D_OUT, run_len)
+    real = zeros(Float32, D_OUT, run_len)
+    rng = seed === nothing ? Random.default_rng() : MersenneTwister(seed)
+
+    @inbounds for i in 1:run_len
+        t_idx_next = (t_idx == SLOTS) ? 1 : (t_idx + 1)
+        x̂ = if solver === :euler
+            integrate_cfm_euler(model, X, t_idx_next; steps=steps, rng=rng)
+        else
+            integrate_cfm_midpoint(model, X, t_idx_next; steps=steps, rng=rng)
+        end
+        pred[:, i] = x̂
+
+        xin = X[:, end, 1]
+        xin_next, t_idx = build_input_from_prediction(xin, x̂, t_idx)
+        xin_next3 = reshape(xin_next, D_IN, 1, 1)
+
+        if size(X, 2) < ctx
+            X = hcat(X, xin_next3)
+        else
+            X = cat(@view(X[:, 2:end, :]), xin_next3; dims=2)
+        end
+    end
+
+    season = season_from_onehot(@view X[1:4, 1, 1])
+    rr = RunResult(season, 0, 1, real, pred)
+    last_ctx = Array{Float32}(X[:, :, 1])
+    return rr, last_ctx
+end
+
+function condense_season_segments(seasons_for_slot::Vector{String})
+    segments = Tuple{String,Int}[]
+    isempty(seasons_for_slot) && return segments
+    cur = seasons_for_slot[1]; cnt = 0
+    @inbounds for s in seasons_for_slot
+        if s == cur
+            cnt += 1
+        else
+            push!(segments, (cur, cnt))
+            cur = s; cnt = 1
+        end
+    end
+    push!(segments, (cur, cnt))
+    return segments
+end
+
+const READABLE_FLOAT_FEATS = Set([
+    "wind_mean_ms","wind_max_ms","wind_min_ms",
+    "rpm_mean","rpm_max","rpm_min",
+])
+
+function apply_value_formatting!(mat::AbstractMatrix)
+    @inbounds for (j, feat) in enumerate(ORDERED_BASE)
+        if feat in READABLE_FLOAT_FEATS
+            mat[j, :] .= round.(Float64.(mat[j, :]); digits=2)
+        else
+            mat[j, :] .= floor.(max.(Float64.(mat[j, :]), 0.0))
+        end
+    end
+    return mat
 end
 
 """
     generate_year_csv(model; year=2021, serial=SERIAL, base=BASE, ctx=CTX,
                       τ=1f0, norm=:year_log1p, stats_path_year=joinpath(base, "stats_by_serial_year.json"),
-                      output_path="generated_year.csv", chunk_slots=2000,
+                      output_path="generated_year.csv",
                       seasons=SEASON_NAMES, fm_steps=38, fm_solver=:midpoint)
 
 Generiert pro Season genügend 10-Minuten-Schritte, um das Kalenderjahr `year`
@@ -228,71 +325,90 @@ function generate_year_csv(model;
                            norm::Symbol=:year_log1p,
                            stats_path_year::AbstractString=joinpath(base, "stats_by_serial_year.json"),
                            output_path::AbstractString="generated_year.csv",
-                           chunk_slots::Int=2000,
                            seasons=SEASON_NAMES,
                            fm_steps::Int=38,
                            fm_solver::Symbol=:midpoint)
     # 1) Zeitachsen + Season-Raster des Zieljahres
+    println("→ Baue Zeitachsen für Jahr $year …")
     times, seasons_for_slot = build_year_slot_timeline(year)
-    slot_counts = Dict{String, Int}(s => 0 for s in seasons)
-    @inbounds for s in seasons_for_slot
-        slot_counts[s] = get(slot_counts, s, 0) + 1
-    end
-    @inbounds for s in Set(seasons_for_slot)
+    segments = condense_season_segments(seasons_for_slot)
+    @inbounds for (s, _) in segments
         @assert s in seasons "Season $s kommt im Jahresraster vor, ist aber nicht in `seasons` erlaubt."
     end
+    println("→ Gefundene Segmente (Season, Slots): $(segments)")
 
     # 2) Daten laden
+    println("→ Lade Blöcke und Jahres-Stats …")
     seqs = load_blocks_for_serial(base, serial;
                                   norm=norm,
                                   seasons=seasons,
                                   stats_path_year=stats_path_year)
     stats_year = load_stats_year(stats_path_year)
 
-    # 3) Pro Season generieren
-    preds_by_season = Dict{String, Matrix{Float32}}()
-    for s in seasons
-        needed = get(slot_counts, s, 0)
-        needed == 0 && continue
-        buf = Array{Float32}(undef, D_OUT, needed)
-        preds_by_season[s] = generate_denormed_season_slots!(buf, model, seqs, stats_year;
-                                                             season=s,
-                                                             serial=serial,
-                                                             base_dir=base,
-                                                             stats_path_year=stats_path_year,
-                                                             seasons=seasons,
-                                                             norm=norm,
-                                                             ctx=ctx,
-                                                             τ=τ,
-                                                             chunk_slots=chunk_slots,
-                                                             fm_steps=fm_steps,
-                                                             fm_solver=fm_solver)
-    end
+    # 3) Initialen Kontext aus erster Season ziehen (typisch Winter)
+    first_season = first(segments)[1]
+    ctx_mat = pick_random_context(seqs, first_season; ctx=ctx)
+    println("→ Starte mit Season $first_season, zufälliger Kontextgröße $ctx gewählt.")
 
-    # 4) In chronologischer Reihenfolge zusammenfügen
     n = length(times)
-    time_col = [string(t) * ".0" for t in times]
-    cols = Dict{String, Vector{Float64}}(feat => Vector{Float64}(undef, n) for feat in ORDERED_BASE)
-    season_offsets = Dict{String, Int}(s => 1 for s in seasons)
+    year_mat = Array{Float64}(undef, D_OUT, n)
 
-    @inbounds for i in 1:n
-        s = seasons_for_slot[i]
-        idx = season_offsets[s]
-        pred_mat = preds_by_season[s]
-        for (j, feat) in enumerate(ORDERED_BASE)
-            cols[feat][i] = pred_mat[j, idx]
+    pos = 0
+    last_ctx = ctx_mat
+
+    for (seg_idx, (s, len_slots)) in enumerate(segments)
+        println("→ Generiere Segment $seg_idx: $s mit $len_slots Slots …")
+        ctx_for_seg = seg_idx == 1 ? last_ctx : retag_context(last_ctx, s; reset_time=true)
+
+        if model isa FMTransformer
+            rr, last_ctx = generate_from_context(model, ctx_for_seg;
+                                                 run_len=len_slots,
+                                                 τ=τ,
+                                                 steps=fm_steps,
+                                                 solver=fm_solver)
+        else
+            rr, last_ctx = generate_from_context(model, ctx_for_seg;
+                                                 run_len=len_slots,
+                                                 τ=τ)
         end
-        season_offsets[s] = idx + 1
+
+        _, pred_d = denorm_mats(rr, serial, stats_year;
+                                cols=ORDERED_BASE,
+                                norm=norm,
+                                base_dir=base,
+                                seasons=seasons,
+                                stats_path_year=stats_path_year)
+        pred_d64 = Array{Float64}(pred_d)
+        apply_value_formatting!(pred_d64)
+
+        @inbounds year_mat[:, pos+1 : pos+len_slots] .= pred_d64[:, 1:len_slots]
+        pos += len_slots
     end
 
-    # 5) DataFrame + CSV
+    @assert pos == n "Befüllte Slots ($pos) stimmen nicht mit Zeitleiste ($n) überein."
+
+    time_col = [string(t) * ".0" for t in times]
     df = DataFrame()
     df[!, "time"] = time_col
-    for feat in ORDERED_BASE
-        df[!, feat] = cols[feat]
+    for (j, feat) in enumerate(ORDERED_BASE)
+        col = vec(year_mat[j, :])
+        if feat in READABLE_FLOAT_FEATS
+            df[!, feat] = col
+        else
+            df[!, feat] = Int.(col)
+        end
     end
 
+    println("→ Schreibe CSV nach $output_path …")
     CSV.write(output_path, df)
+
+    println("→ Plot erstelle …")
+    traces_real, traces_pred = traces_for_denorm_mats(year_mat, year_mat; cols=ORDERED_BASE)
+    p = plot(vcat(traces_real, traces_pred))
+    
+    display(p)
+
+    println("→ Fertig. Gesamt-Slots: $n, Datei: $output_path")
     return output_path
 end
 
