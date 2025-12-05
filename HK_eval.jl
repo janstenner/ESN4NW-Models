@@ -438,6 +438,107 @@ function plot_generated_csv(path::AbstractString="generated_year.csv")
     return p
 end
 
+"""
+    interpolate_generated_csv(path="generated_year.csv")
+
+Liest eine generierte Jahres-CSV (10-Minuten-Raster), interpoliert auf 15-Minuten-
+Raster gemäß der 10/5-Minuten-Gewichte und speichert als `*_15min.csv` mit
+der gleichen Rundungslogik wie `generate_year_csv`. Plottet anschließend Original
+und interpoliertes Set untereinander.
+"""
+function interpolate_generated_csv(path::AbstractString="generated_year.csv")
+    println("→ Lade CSV aus $path …")
+    df = CSV.read(path, DataFrame; normalizenames=false)
+    @assert "time" in names(df) "Spalte 'time' fehlt in CSV."
+    for feat in ORDERED_BASE
+        @assert feat in names(df) "Spalte $feat fehlt in CSV."
+    end
+
+    n_orig = nrow(df)
+    times_orig = Vector{DateTime}(undef, n_orig)
+    @inbounds for i in 1:n_orig
+        rawt = df[!, "time"][i]
+        tstr = string(rawt)
+        tclean = replace(tstr, r"\\.0$" => "")
+        times_orig[i] = DateTime(tclean)
+    end
+
+    orig_mat = Array{Float64}(undef, D_OUT, n_orig)
+    @inbounds for (j, feat) in enumerate(ORDERED_BASE)
+        orig_mat[j, :] .= Float64.(df[!, feat])
+    end
+
+    start_t = times_orig[1]
+    end_t   = times_orig[end]
+    step15  = Minute(15)
+    times_15 = DateTime[]
+    tcur = start_t
+    while tcur <= end_t
+        push!(times_15, tcur)
+        tcur += step15
+    end
+    n_new = length(times_15)
+    println("→ Interpoliere auf 15-Minuten-Raster: $n_orig → $n_new Zeilen …")
+
+    new_mat = Array{Float64}(undef, D_OUT, n_new)
+    @inbounds for i in 1:n_new
+        if i == 1
+            new_mat[:, i] .= orig_mat[:, 1]
+            continue
+        end
+        target = times_15[i]
+        minutes = Int(fld(Dates.value(target - start_t), 60_000))
+        window_start = minutes - 15
+        window_end   = minutes
+
+        idx_high = min(Int(ceil(minutes / 10)) + 1, n_orig)
+        idx_low  = max(1, idx_high - 1)
+
+        low_end   = (idx_low  - 1) * 10
+        low_start = low_end - 10
+        high_end   = (idx_high - 1) * 10
+        high_start = high_end - 10
+
+        overlap_low  = max(0, min(window_end, low_end)  - max(window_start, low_start))
+        overlap_high = max(0, min(window_end, high_end) - max(window_start, high_start))
+        total = overlap_low + overlap_high
+
+        total > 0 || error("Keine Überlappung für Index $i, minutes=$minutes")
+
+        @views new_mat[:, i] .= (overlap_low .* orig_mat[:, idx_low] .+ overlap_high .* orig_mat[:, idx_high]) ./ total
+    end
+
+    apply_value_formatting!(new_mat)
+
+    root, ext = splitext(path)
+    ext_final = ext == "" ? ".csv" : ext
+    out_path = string(root, "_15min", ext_final)
+
+    df_new = DataFrame()
+    df_new[!, "time"] = [string(t) * ".0" for t in times_15]
+    for (j, feat) in enumerate(ORDERED_BASE)
+        col = vec(new_mat[j, :])
+        if feat in READABLE_FLOAT_FEATS
+            df_new[!, feat] = col
+        else
+            df_new[!, feat] = Int.(col)
+        end
+    end
+
+    println("→ Schreibe 15-Minuten-CSV nach $out_path …")
+    CSV.write(out_path, df_new)
+
+    println("→ Plotte Original vs. 15-Minuten …")
+    traces_orig_real, traces_orig_pred = traces_for_denorm_mats(orig_mat, orig_mat; cols=ORDERED_BASE)
+    traces_new_real, traces_new_pred   = traces_for_denorm_mats(new_mat, new_mat; cols=ORDERED_BASE)
+    p_orig = plot(vcat(traces_orig_real, traces_orig_pred))
+    p_new  = plot(vcat(traces_new_real, traces_new_pred))
+    display([p_orig; p_new])
+
+    println("→ Fertig: $out_path")
+    return out_path
+end
+
 
 
 # FM-Variante: autoregressiver 500er-Run via ODE-Integration (CFM)
@@ -559,7 +660,6 @@ function traces_for_run(rr::RunResult; cols=ORDERED_BASE)
     end
     return traces_real, traces_pred
 end
-
 
 # ---- Denormalisierung ---------------------------------------------------------
 # Erwartet: stats_year[serial][feat] => (mu, sigma)

@@ -2,6 +2,7 @@
 /Manifest.toml
 
 generated_year.csv
+generated_year_15min.csv
 
 Entwärmungsmessung/*
 HK_blocks/*
