@@ -321,13 +321,11 @@ function (m::FMTransformer)(x,t)
 
     x = ensure_3d(x; d_in=D_IN)          # ← neu, macht aus 2D/Vector → 3D
 
-
-    # x: (D_IN, T, B)  〈— deine eingebetteten Features pro Schritt
+    # x: (D_IN, T, B)
     h = m.inproj(x)            # (D_MODEL, T, B)
 
 
     # 1) Token-Typ addieren
-    # h: (D_MODEL, T, B)
     flow_col = size(h, 2); B = size(h, 3)
 
     # Type-Embeddings als (D_MODEL,1,1)
@@ -346,12 +344,10 @@ function (m::FMTransformer)(x,t)
     T = size(h, 2); B = size(h, 3)
     mask = repeat(NNlib.make_causal_mask(zeros(Bool, T, T)), 1, 1, N_HEAD, B) # (T,T,Heads,B), Bool
 
-    # MultiHeadAttention will (kv_len,q_len,heads,batch); unsere (T,T,…) passt
     for blk in m.blocks
         h = blk(h, mask)
     end
     h = m.ln_final(h)          # (D_MODEL, T, B)
-
 
     output = m.head(Array(@view h[:, flow_col, :]))         # (D_OUT, B); copy vermeidet SubArray-Mutation
     return output

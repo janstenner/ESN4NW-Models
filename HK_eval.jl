@@ -1,6 +1,7 @@
 
 
 using Random, LinearAlgebra
+using Dates, CSV, DataFrames
 using PlotlyJS            # pkg> add PlotlyJS
 
 
@@ -123,6 +124,178 @@ function generate_run!(model::ARTransformer, E::AbstractMatrix{<:Real};
     season = season_from_onehot(@view E[1:4, 1])
     return RunResult(season, 0, s, real, pred)  # seq_id wird später gesetzt
 end
+
+
+
+# ---- Ganzjahres-Generation ---------------------------------------------------
+const SLOT_MINUTES = Int(div(24*60, SLOTS))  # 10-Minuten-Raster pro Slot
+
+"""
+    build_year_slot_timeline(year) -> (times, seasons_for_slot)
+
+Erzeugt Vektoren aller 10-Minuten-Slots eines Kalenderjahres (chronologisch),
+inkl. der zugehörigen Season-Labels laut `season_str`.
+"""
+function build_year_slot_timeline(year::Int)
+    slot_step = Minute(SLOT_MINUTES)
+    times = DateTime[]
+    seasons_for_slot = String[]
+
+    for d in Date(year, 1, 1):Day(1):Date(year, 12, 31)
+        s = season_str(DateTime(d))
+        base_dt = DateTime(d)
+        @inbounds for k in 0:(SLOTS-1)
+            push!(times, base_dt + slot_step * k)
+            push!(seasons_for_slot, s)
+        end
+    end
+    return times, seasons_for_slot
+end
+
+# Generiert z-normalisierte Runs stückweise, denormalisiert sie sofort und
+# füllt einen (D_OUT, slots_needed)-Puffer.
+function generate_denormed_season_slots!(dest::AbstractMatrix{Float32},
+                                         model,
+                                         seqs::Vector{<:AbstractMatrix},
+                                         stats_year;
+                                         season::AbstractString,
+                                         serial::AbstractString=SERIAL,
+                                         base_dir::AbstractString=BASE,
+                                         stats_path_year::AbstractString=joinpath(base_dir, "stats_by_serial_year.json"),
+                                         seasons=SEASON_NAMES,
+                                         norm::Symbol=:year_log1p,
+                                         ctx::Int=CTX,
+                                         τ::Float32=1f0,
+                                         chunk_slots::Int=2000,
+                                         fm_steps::Int=38,
+                                         fm_solver::Symbol=:midpoint)
+    idxs = filter_by_season(seqs, season)
+    @assert !isempty(idxs) "Keine Blöcke für Season=$season gefunden."
+
+    max_run_len = maximum(size(seqs[i], 2) - ctx for i in idxs)
+    @assert max_run_len > 0 "Sequenzen für Season=$season sind kürzer als ctx=$ctx."
+    chunk = min(chunk_slots, max_run_len)
+
+    filled = 0
+    total = size(dest, 2)
+
+    while filled < total
+        run_len = min(chunk, total - filled)
+        rr = nothing
+        for _ in 1:200
+            si = rand(idxs)
+            E  = seqs[si]
+            if size(E, 2) >= ctx + run_len
+                if model isa FMTransformer
+                    rr = generate_run!(model, E; run_len=run_len, ctx=ctx, τ=τ, steps=fm_steps, solver=fm_solver)
+                else
+                    rr = generate_run!(model, E; run_len=run_len, ctx=ctx, τ=τ)
+                end
+                rr.seq_id = si
+                break
+            end
+        end
+        rr === nothing && error("Finde keinen ausreichend langen Block für Season=$season, run_len=$run_len.")
+
+        _, pred_d = denorm_mats(rr, serial, stats_year;
+                                cols=ORDERED_BASE,
+                                norm=norm,
+                                base_dir=base_dir,
+                                seasons=seasons,
+                                stats_path_year=stats_path_year)
+        dest[:, filled+1 : filled+run_len] .= pred_d[:, 1:run_len]
+        filled += run_len
+    end
+    return dest
+end
+
+"""
+    generate_year_csv(model; year=2021, serial=SERIAL, base=BASE, ctx=CTX,
+                      τ=1f0, norm=:year_log1p, stats_path_year=joinpath(base, "stats_by_serial_year.json"),
+                      output_path="generated_year.csv", chunk_slots=2000,
+                      seasons=SEASON_NAMES, fm_steps=38, fm_solver=:midpoint)
+
+Generiert pro Season genügend 10-Minuten-Schritte, um das Kalenderjahr `year`
+vollständig abzudecken, denormalisiert sie und schreibt eine CSV mit
+`time` + `ORDERED_BASE`-Spalten.
+"""
+function generate_year_csv(model;
+                           year::Int=2026,
+                           serial::AbstractString=SERIAL,
+                           base::AbstractString=BASE,
+                           ctx::Int=CTX,
+                           τ::Float32=1f0,
+                           norm::Symbol=:year_log1p,
+                           stats_path_year::AbstractString=joinpath(base, "stats_by_serial_year.json"),
+                           output_path::AbstractString="generated_year.csv",
+                           chunk_slots::Int=2000,
+                           seasons=SEASON_NAMES,
+                           fm_steps::Int=38,
+                           fm_solver::Symbol=:midpoint)
+    # 1) Zeitachsen + Season-Raster des Zieljahres
+    times, seasons_for_slot = build_year_slot_timeline(year)
+    slot_counts = Dict{String, Int}(s => 0 for s in seasons)
+    @inbounds for s in seasons_for_slot
+        slot_counts[s] = get(slot_counts, s, 0) + 1
+    end
+    @inbounds for s in Set(seasons_for_slot)
+        @assert s in seasons "Season $s kommt im Jahresraster vor, ist aber nicht in `seasons` erlaubt."
+    end
+
+    # 2) Daten laden
+    seqs = load_blocks_for_serial(base, serial;
+                                  norm=norm,
+                                  seasons=seasons,
+                                  stats_path_year=stats_path_year)
+    stats_year = load_stats_year(stats_path_year)
+
+    # 3) Pro Season generieren
+    preds_by_season = Dict{String, Matrix{Float32}}()
+    for s in seasons
+        needed = get(slot_counts, s, 0)
+        needed == 0 && continue
+        buf = Array{Float32}(undef, D_OUT, needed)
+        preds_by_season[s] = generate_denormed_season_slots!(buf, model, seqs, stats_year;
+                                                             season=s,
+                                                             serial=serial,
+                                                             base_dir=base,
+                                                             stats_path_year=stats_path_year,
+                                                             seasons=seasons,
+                                                             norm=norm,
+                                                             ctx=ctx,
+                                                             τ=τ,
+                                                             chunk_slots=chunk_slots,
+                                                             fm_steps=fm_steps,
+                                                             fm_solver=fm_solver)
+    end
+
+    # 4) In chronologischer Reihenfolge zusammenfügen
+    n = length(times)
+    time_col = [string(t) * ".0" for t in times]
+    cols = Dict{String, Vector{Float64}}(feat => Vector{Float64}(undef, n) for feat in ORDERED_BASE)
+    season_offsets = Dict{String, Int}(s => 1 for s in seasons)
+
+    @inbounds for i in 1:n
+        s = seasons_for_slot[i]
+        idx = season_offsets[s]
+        pred_mat = preds_by_season[s]
+        for (j, feat) in enumerate(ORDERED_BASE)
+            cols[feat][i] = pred_mat[j, idx]
+        end
+        season_offsets[s] = idx + 1
+    end
+
+    # 5) DataFrame + CSV
+    df = DataFrame()
+    df[!, "time"] = time_col
+    for feat in ORDERED_BASE
+        df[!, feat] = cols[feat]
+    end
+
+    CSV.write(output_path, df)
+    return output_path
+end
+
 
 
 # FM-Variante: autoregressiver 500er-Run via ODE-Integration (CFM)
